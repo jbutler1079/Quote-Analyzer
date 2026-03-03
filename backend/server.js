@@ -24,6 +24,7 @@ const PAY_PERIODS_PER_MONTH = {
 
 // ── In-memory store ──────────────────────────────────────────────────────────
 const caseStore = new Map(); // caseId → { files, plans, census, recommendations }
+let lastExtractDebug = null; // Stores last extraction debug info
 
 function defaultContributionConfig() {
   return {
@@ -157,7 +158,13 @@ const upload = multer({
 // ── Auth middleware (disabled – internal tool) ───────────────────────────────
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'bcbs-strategy9-v2', strategies: 9 }));
+
+// ── Debug: last extraction info ───────────────────────────────────────────────
+app.get('/debug/lastextract', (_req, res) => {
+  if (!lastExtractDebug) return res.status(404).json({ error: 'No extraction yet' });
+  res.json(lastExtractDebug);
+});
 
 // ── Debug: extract plans from raw text (for testing without PDF) ──────────────
 app.post('/debug/extract', (req, res) => {
@@ -456,7 +463,19 @@ function extractPlanFromText(text, sourceFile) {
     candidates.sort((a, b) => b.score - a.score);
     const best = candidates[0];
     console.log(`[EXTRACT] Winner: "${best.name}" with ${best.plans.length} plans, score=${best.score}`);
+    console.log(`[EXTRACT] All candidates:`, candidates.map(c => `${c.name}: ${c.plans.length} plans, score=${c.score}`));
     plans = best.plans;
+
+    // Store debug info for last extraction
+    lastExtractDebug = {
+      timestamp: new Date().toISOString(),
+      sourceFile,
+      winner: best.name,
+      winnerPlans: best.plans.length,
+      winnerScore: best.score,
+      allCandidates: candidates.map(c => ({ name: c.name, plans: c.plans.length, score: c.score })),
+      planNames: best.plans.map(p => p.planName),
+    };
   }
 
   // ── Strategy 7: Fallback — entire text as one block ─────────────────────
