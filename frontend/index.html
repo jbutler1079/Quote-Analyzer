@@ -57,14 +57,7 @@
           <label for="effectiveDate">Effective Date <span class="optional">(optional)</span></label>
           <input type="text" id="effectiveDate" placeholder="e.g. 01/01/2025" />
         </div>
-        <div class="form-group">
-          <label for="apiUrl">API URL</label>
-          <input type="url" id="apiUrl" value="http://localhost:3001" />
-        </div>
-        <div class="form-group">
-          <label for="apiToken">API Token</label>
-          <input type="password" id="apiToken" value="internal-token-2024" autocomplete="off" />
-        </div>
+
       </div>
     </section>
 
@@ -132,10 +125,65 @@
       </div>
     </section>
 
+    <!-- Section: Employer Contribution Setup -->
+    <section class="card" id="contributionSection">
+      <h2 class="card-title">
+        <span class="step-badge">4</span>
+        Employer Contribution Setup
+      </h2>
+      <p class="section-hint">Set employer contribution rules and payroll frequency to calculate employer vs employee per-pay-period amounts.</p>
+
+      <div class="form-grid contribution-top-grid">
+        <div class="form-group">
+          <label for="payrollFrequency">Payroll Frequency</label>
+          <select id="payrollFrequency" onchange="updateContributionSettings()">
+            <option value="weekly">Weekly (52 pay periods)</option>
+            <option value="biweekly" selected>Bi-Weekly (26 pay periods)</option>
+            <option value="semimonthly">Semi-Monthly (24 pay periods)</option>
+            <option value="monthly">Monthly (12 pay periods)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="contribution-grid" role="group" aria-label="Employer contribution inputs by tier">
+        <div class="contribution-header">Tier</div>
+        <div class="contribution-header">Contribution Type</div>
+        <div class="contribution-header">Employer Contribution Value</div>
+
+        <div class="contribution-tier-label">EE <span>Employee Only</span></div>
+        <select id="eeContributionType" onchange="updateContributionSettings()">
+          <option value="percent" selected>Percentage (%)</option>
+          <option value="dollar">Dollar Amount ($)</option>
+        </select>
+        <input type="number" id="eeContributionValue" min="0" step="0.01" value="0" oninput="updateContributionSettings()" />
+
+        <div class="contribution-tier-label">ES <span>Emp + Spouse</span></div>
+        <select id="esContributionType" onchange="updateContributionSettings()">
+          <option value="percent" selected>Percentage (%)</option>
+          <option value="dollar">Dollar Amount ($)</option>
+        </select>
+        <input type="number" id="esContributionValue" min="0" step="0.01" value="0" oninput="updateContributionSettings()" />
+
+        <div class="contribution-tier-label">EC <span>Emp + Child(ren)</span></div>
+        <select id="ecContributionType" onchange="updateContributionSettings()">
+          <option value="percent" selected>Percentage (%)</option>
+          <option value="dollar">Dollar Amount ($)</option>
+        </select>
+        <input type="number" id="ecContributionValue" min="0" step="0.01" value="0" oninput="updateContributionSettings()" />
+
+        <div class="contribution-tier-label">EF <span>Family</span></div>
+        <select id="efContributionType" onchange="updateContributionSettings()">
+          <option value="percent" selected>Percentage (%)</option>
+          <option value="dollar">Dollar Amount ($)</option>
+        </select>
+        <input type="number" id="efContributionValue" min="0" step="0.01" value="0" oninput="updateContributionSettings()" />
+      </div>
+    </section>
+
     <!-- Section: Extracted Plans -->
     <section class="card hidden" id="plansSection">
       <h2 class="card-title">
-        <span class="step-badge">4</span>
+        <span class="step-badge">5</span>
         Extracted Plans
         <span class="badge-count" id="plansCount">0</span>
       </h2>
@@ -145,15 +193,20 @@
           <thead>
             <tr>
               <th data-col="carrier" class="sortable" tabindex="0">Carrier <span class="sort-icon">↕</span></th>
-              <th data-col="planName" class="sortable" tabindex="0">Plan Name <span class="sort-icon">↕</span></th>
-              <th data-col="networkType" class="sortable" tabindex="0">Network <span class="sort-icon">↕</span></th>
+              <th data-col="planName" class="sortable" tabindex="0">Plan <span class="sort-icon">↕</span></th>
+              <th data-col="networkType" class="sortable" tabindex="0">Net <span class="sort-icon">↕</span></th>
               <th data-col="metalLevel" class="sortable" tabindex="0">Metal <span class="sort-icon">↕</span></th>
-              <th data-col="deductibleIndividual" class="sortable" tabindex="0">Ded. (Ind) <span class="sort-icon">↕</span></th>
-              <th data-col="oopMaxIndividual" class="sortable" tabindex="0">OOP Max (Ind) <span class="sort-icon">↕</span></th>
-              <th data-col="copayPCP" class="sortable" tabindex="0">PCP Copay <span class="sort-icon">↕</span></th>
-              <th data-col="premiumEE" class="sortable" tabindex="0">EE Premium <span class="sort-icon">↕</span></th>
-              <th data-col="extractionConfidence" class="sortable" tabindex="0">Confidence <span class="sort-icon">↕</span></th>
-              <th>Source</th>
+              <th data-col="deductibleIndividual" class="sortable" tabindex="0">Ded <span class="sort-icon">↕</span></th>
+              <th data-col="oopMaxIndividual" class="sortable" tabindex="0">OOP <span class="sort-icon">↕</span></th>
+              <th data-col="copayPCP" class="sortable" tabindex="0">PCP <span class="sort-icon">↕</span></th>
+              <th data-col="premiumEE" class="sortable" tabindex="0">EE <span class="sort-icon">↕</span></th>
+              <th data-col="premiumES" class="sortable" tabindex="0">ES <span class="sort-icon">↕</span></th>
+              <th data-col="premiumEC" class="sortable" tabindex="0">EC <span class="sort-icon">↕</span></th>
+              <th data-col="premiumEF" class="sortable" tabindex="0">EF <span class="sort-icon">↕</span></th>
+              <th class="cost-col">ER/Pay</th>
+              <th class="cost-col">EE/Pay</th>
+              <th data-col="extractionConfidence" class="sortable" tabindex="0">Conf <span class="sort-icon">↕</span></th>
+              <th>Src</th>
             </tr>
           </thead>
           <tbody id="plansTableBody"></tbody>
@@ -164,7 +217,7 @@
     <!-- Section: Recommendations -->
     <section class="card hidden" id="recommendationsSection">
       <h2 class="card-title">
-        <span class="step-badge">5</span>
+        <span class="step-badge">6</span>
         Top Recommendations
       </h2>
       <div class="rec-cards" id="recCards"></div>
@@ -173,10 +226,11 @@
     <!-- Section: Generate Outputs -->
     <section class="card hidden" id="outputsSection">
       <h2 class="card-title">
-        <span class="step-badge">6</span>
+        <span class="step-badge">7</span>
         Generate Outputs
       </h2>
       <p class="section-hint">Download the analysis as a presentation or spreadsheet for client delivery.</p>
+      <p class="output-assumptions" id="contributionSummary"></p>
       <div class="output-actions">
         <button class="btn btn-primary btn-export" onclick="downloadPPTX()">
           <svg viewBox="0 0 20 20" fill="currentColor" class="btn-icon" aria-hidden="true"><path d="M3 4a2 2 0 012-2h10a2 2 0 012 2v12a2 2 0 01-2 2H5a2 2 0 01-2-2V4zm2 0v12h10V4H5z"/><path d="M7 7h6v2H7V7zm0 4h6v2H7v-2z"/></svg>

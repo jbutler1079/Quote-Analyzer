@@ -15,5 +15,8 @@
     "pdf-parse": "^1.1.1",
     "pptxgenjs": "^3.12.0",
     "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "pdfkit": "^0.17.2"
   }
 }

@@ -4,29 +4,41 @@ const state = {
   files: [],      // { name, size, type, file: File }
   plans: [],      // parsed plan objects
   census: { ee: 0, es: 0, ec: 0, ef: 0 },
+  contribution: {
+    payrollFrequency: 'biweekly',
+    tiers: {
+      ee: { type: 'percent', value: 0 },
+      es: { type: 'percent', value: 0 },
+      ec: { type: 'percent', value: 0 },
+      ef: { type: 'percent', value: 0 },
+    },
+  },
   recommendations: null,
   sortCol: null,
   sortDir: 'asc',
 };
 
+const COVERAGE_TIERS = ['ee', 'es', 'ec', 'ef'];
+const PREMIUM_KEY_BY_TIER = { ee: 'premiumEE', es: 'premiumES', ec: 'premiumEC', ef: 'premiumEF' };
+const PAY_PERIODS_PER_MONTH = {
+  weekly: 52 / 12,
+  biweekly: 26 / 12,
+  semimonthly: 24 / 12,
+  monthly: 1,
+};
+
+/* ── Configuration ───────────────────────────────────────────────────────── */
+// When served from the same server (port 3001), leave as '' (same origin).
+// For external embed, set to your deployed backend URL e.g. 'https://your-api.example.com'
+const API_BASE = '';
+
 /* ── API helpers ──────────────────────────────────────────────────────────── */
-function getApiBase() {
-  const url = document.getElementById('apiUrl').value.trim();
-  return url.replace(/\/$/, '');
-}
-
-function getToken() {
-  return document.getElementById('apiToken').value.trim();
-}
-
-function authHeaders() {
-  return { 'X-API-Token': getToken() };
-}
+function getApiBase() { return API_BASE; }
 
 async function apiPost(path, body) {
   const resp = await fetch(`${getApiBase()}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
@@ -39,7 +51,6 @@ async function apiPost(path, body) {
 async function apiPostForm(path, formData) {
   const resp = await fetch(`${getApiBase()}${path}`, {
     method: 'POST',
-    headers: authHeaders(),
     body: formData,
   });
   if (!resp.ok) {
@@ -52,7 +63,7 @@ async function apiPostForm(path, formData) {
 async function apiPostBlob(path, body) {
   const resp = await fetch(`${getApiBase()}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
@@ -187,24 +198,37 @@ async function processFiles() {
 
 /* ── Plans Table ──────────────────────────────────────────────────────────── */
 const EDITABLE_COLS = ['carrier', 'planName', 'networkType', 'metalLevel',
-  'deductibleIndividual', 'oopMaxIndividual', 'copayPCP', 'premiumEE'];
+  'deductibleIndividual', 'oopMaxIndividual', 'copayPCP', 'premiumEE', 'premiumES', 'premiumEC', 'premiumEF'];
+
+const FREQ_LABEL = {
+  weekly: 'Weekly',
+  biweekly: 'Bi-Weekly',
+  semimonthly: 'Semi-Monthly',
+  monthly: 'Monthly',
+};
 
 function renderPlansTable(plans) {
   const tbody = document.getElementById('plansTableBody');
   tbody.innerHTML = '';
 
   if (plans.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:24px;color:var(--muted)">No plans extracted</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;padding:24px;color:var(--muted)">No plans extracted</td></tr>';
     return;
   }
 
   const fmtMoney = v => v != null ? `$${Number(v).toLocaleString()}` : '—';
+  const fmtPrem  = v => v != null ? `$${Number(v).toFixed(2)}` : '—';
   const fmtStr   = v => v || '—';
 
   plans.forEach((plan, rowIdx) => {
     const conf = plan.extractionConfidence || 0;
     const confPct = Math.round(conf * 100);
     const confClass = conf >= 0.7 ? '' : conf >= 0.4 ? 'medium' : 'low';
+
+    // Cost breakdown per pay period
+    const contrib = calculateContributionBreakdown(plan);
+    const erPay = contrib.employerPerPayTotal;
+    const eePay = contrib.employeePerPayTotal;
 
     const tr = document.createElement('tr');
     tr.setAttribute('data-idx', rowIdx);
@@ -217,7 +241,22 @@ function renderPlansTable(plans) {
       { col: 'deductibleIndividual',  val: fmtMoney(plan.deductibleIndividual), editable: true },
       { col: 'oopMaxIndividual',      val: fmtMoney(plan.oopMaxIndividual),   editable: true },
       { col: 'copayPCP',              val: plan.copayPCP != null ? `$${plan.copayPCP}` : '—', editable: true },
-      { col: 'premiumEE',             val: plan.premiumEE != null ? `$${plan.premiumEE.toFixed(2)}` : '—', editable: true },
+      { col: 'premiumEE',             val: fmtPrem(plan.premiumEE), editable: true },
+      { col: 'premiumES',             val: fmtPrem(plan.premiumES), editable: true },
+      { col: 'premiumEC',             val: fmtPrem(plan.premiumEC), editable: true },
+      { col: 'premiumEF',             val: fmtPrem(plan.premiumEF), editable: true },
+      {
+        col: '_erPerPay',
+        val: `<span class="er-cost">${erPay > 0 ? fmtPrem(erPay) : '—'}</span>`,
+        editable: false,
+        cssClass: 'cost-col',
+      },
+      {
+        col: '_eePerPay',
+        val: `<span class="ee-cost">${eePay > 0 ? fmtPrem(eePay) : '—'}</span>`,
+        editable: false,
+        cssClass: 'cost-col',
+      },
       {
         col: 'extractionConfidence',
         val: `<div class="confidence-bar-wrap">
@@ -229,13 +268,16 @@ function renderPlansTable(plans) {
       { col: 'sourceFile', val: `<span style="font-size:0.75rem;color:var(--muted)" title="${escHtml(plan.sourceFile || '')}">${escHtml(truncate(plan.sourceFile || '—', 20))}</span>`, editable: false },
     ];
 
-    cells.forEach(({ col, val, editable }) => {
+    cells.forEach(({ col, val, editable, cssClass }) => {
       const td = document.createElement('td');
+      if (cssClass) td.className = cssClass;
       if (editable) {
-        td.className = 'editable';
+        td.className = (td.className ? td.className + ' ' : '') + 'editable';
         td.setAttribute('data-col', col);
         td.setAttribute('data-idx', rowIdx);
         td.innerHTML = val;
+        // Add tooltip for plan name (may be truncated by CSS)
+        if (col === 'planName') td.title = plan.planName || '';
         td.addEventListener('click', startCellEdit);
       } else {
         td.innerHTML = val;
@@ -338,6 +380,155 @@ function updateCensus() {
   };
   const total = state.census.ee + state.census.es + state.census.ec + state.census.ef;
   document.getElementById('censusTotal').textContent = total;
+
+  // Re-render plans table so ER/EE cost columns update with new enrollment
+  if (state.plans.length > 0) {
+    renderPlansTable(state.plans);
+  }
+
+  // Re-render recommendations if they exist
+  if (state.recommendations) {
+    renderRecommendations(state.recommendations);
+  }
+
+  renderContributionSummary();
+}
+
+function updateContributionSettings() {
+  const getType = tier => (document.getElementById(`${tier}ContributionType`)?.value === 'dollar' ? 'dollar' : 'percent');
+  const getValue = tier => {
+    const raw = parseFloat(document.getElementById(`${tier}ContributionValue`)?.value || '0');
+    return Number.isFinite(raw) && raw > 0 ? raw : 0;
+  };
+
+  state.contribution = {
+    payrollFrequency: document.getElementById('payrollFrequency')?.value || 'biweekly',
+    tiers: {
+      ee: { type: getType('ee'), value: getValue('ee') },
+      es: { type: getType('es'), value: getValue('es') },
+      ec: { type: getType('ec'), value: getValue('ec') },
+      ef: { type: getType('ef'), value: getValue('ef') },
+    },
+  };
+
+  if (state.recommendations) {
+    renderRecommendations(state.recommendations);
+  }
+
+  // Re-render plans table so ER/EE cost columns update
+  if (state.plans.length > 0) {
+    renderPlansTable(state.plans);
+  }
+
+  renderContributionSummary();
+}
+
+function renderContributionSummary() {
+  const el = document.getElementById('contributionSummary');
+  if (!el) return;
+
+  const freqLabelMap = {
+    weekly: 'Weekly',
+    biweekly: 'Bi-Weekly',
+    semimonthly: 'Semi-Monthly',
+    monthly: 'Monthly',
+  };
+  const labelByTier = {
+    ee: 'EE',
+    es: 'ES',
+    ec: 'EC',
+    ef: 'EF',
+  };
+
+  const contribution = state.contribution || {
+    payrollFrequency: 'biweekly',
+    tiers: {
+      ee: { type: 'percent', value: 0 },
+      es: { type: 'percent', value: 0 },
+      ec: { type: 'percent', value: 0 },
+      ef: { type: 'percent', value: 0 },
+    },
+  };
+
+  const tierSummary = COVERAGE_TIERS.map(tier => {
+    const rule = contribution.tiers[tier] || { type: 'percent', value: 0 };
+    if (rule.type === 'dollar') {
+      return `${labelByTier[tier]}: $${Number(rule.value || 0).toFixed(2)}`;
+    }
+    return `${labelByTier[tier]}: ${Number(rule.value || 0).toFixed(2)}%`;
+  }).join(' | ');
+
+  el.textContent = `Contribution assumptions for exports — Payroll: ${freqLabelMap[contribution.payrollFrequency] || 'Bi-Weekly'} | ${tierSummary}`;
+}
+
+function calculateContributionBreakdown(plan) {
+  const frequency = state.contribution?.payrollFrequency || 'biweekly';
+  const payPeriodsPerMonth = PAY_PERIODS_PER_MONTH[frequency] || PAY_PERIODS_PER_MONTH.biweekly;
+
+  // EE base: what employer covers at the EE level
+  const eePremium = Number(plan[PREMIUM_KEY_BY_TIER.ee]) || 0;
+  const eeRule = state.contribution?.tiers?.ee || { type: 'percent', value: 0 };
+  let eeBaseEmployer = 0;
+  if (eePremium > 0 && eeRule.value > 0) {
+    if (eeRule.type === 'dollar') {
+      eeBaseEmployer = Math.min(eePremium, eeRule.value);
+    } else {
+      eeBaseEmployer = eePremium * (Math.max(0, Math.min(100, eeRule.value)) / 100);
+    }
+  }
+
+  const byTier = {};
+  let employerMonthlyTotal = 0;
+  let employeeMonthlyTotal = 0;
+
+  COVERAGE_TIERS.forEach(tier => {
+    const premiumKey = PREMIUM_KEY_BY_TIER[tier];
+    const premiumMonthly = Number(plan[premiumKey]) || 0;
+    const enrolled = Number(state.census[tier]) || 0;
+    const rule = state.contribution?.tiers?.[tier] || { type: 'percent', value: 0 };
+
+    let employerPerMemberMonthly = 0;
+    if (premiumMonthly > 0) {
+      if (tier === 'ee') {
+        // EE tier: straightforward
+        employerPerMemberMonthly = eeBaseEmployer;
+      } else {
+        // Dependent tiers: EE base + tier rule applied to dependent surplus
+        const dependentSurplus = Math.max(0, premiumMonthly - eePremium);
+        let surplusContribution = 0;
+        if (rule.value > 0 && dependentSurplus > 0) {
+          if (rule.type === 'dollar') {
+            surplusContribution = Math.min(dependentSurplus, rule.value);
+          } else {
+            surplusContribution = dependentSurplus * (Math.max(0, Math.min(100, rule.value)) / 100);
+          }
+        }
+        employerPerMemberMonthly = Math.min(premiumMonthly, eeBaseEmployer + surplusContribution);
+      }
+    }
+
+    const employeePerMemberMonthly = Math.max(0, premiumMonthly - employerPerMemberMonthly);
+    const employerMonthly = employerPerMemberMonthly * enrolled;
+    const employeeMonthly = employeePerMemberMonthly * enrolled;
+    employerMonthlyTotal += employerMonthly;
+    employeeMonthlyTotal += employeeMonthly;
+
+    byTier[tier] = {
+      enrolled,
+      premiumMonthly,
+      employerPerPay: employerMonthly / payPeriodsPerMonth,
+      employeePerPay: employeeMonthly / payPeriodsPerMonth,
+      employerPerMemberPerPay: employerPerMemberMonthly / payPeriodsPerMonth,
+      employeePerMemberPerPay: employeePerMemberMonthly / payPeriodsPerMonth,
+    };
+  });
+
+  return {
+    frequency,
+    employerPerPayTotal: employerMonthlyTotal / payPeriodsPerMonth,
+    employeePerPayTotal: employeeMonthlyTotal / payPeriodsPerMonth,
+    byTier,
+  };
 }
 
 /* ── Recommendations ──────────────────────────────────────────────────────── */
@@ -347,7 +538,11 @@ async function getRecommendations() {
 
   showLoading(true, 'Scoring plans…');
   try {
-    const data = await apiPost('/recommend', { caseId: state.caseId, census: state.census });
+    const data = await apiPost('/recommend', {
+      caseId: state.caseId,
+      census: state.census,
+      contribution: state.contribution,
+    });
     state.recommendations = data;
     renderRecommendations(data);
     showSection('recommendationsSection', true);
@@ -365,13 +560,35 @@ function renderRecommendations(data) {
   const container = document.getElementById('recCards');
   container.innerHTML = '';
   const recs = data.recommendations || [];
+  const fmtCurrency = value => `$${Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const freqLabelMap = {
+    weekly: 'Weekly',
+    biweekly: 'Bi-Weekly',
+    semimonthly: 'Semi-Monthly',
+    monthly: 'Monthly',
+  };
 
   recs.forEach(plan => {
     const scoreVal = Math.round((plan.totalScore || 0) * 100);
+    const contribution = calculateContributionBreakdown(plan);
+    const tierLabels = { ee: 'EE Only', es: 'EE + Spouse', ec: 'EE + Child', ef: 'Family' };
+    const perEmpRows = COVERAGE_TIERS.map(tier => {
+      const td = contribution.byTier[tier];
+      return `
+        <div class="rec-peremp-row">
+          <span class="rec-peremp-tier">${tierLabels[tier]}</span>
+          <span class="rec-peremp-er">${fmtCurrency(td.employerPerMemberPerPay)}</span>
+          <span class="rec-peremp-ee">${fmtCurrency(td.employeePerMemberPerPay)}</span>
+        </div>
+      `;
+    }).join('');
+
+    const recLabel = plan.recommendationLabel || (plan.rank === 1 ? 'Top Pick' : plan.rank === 2 ? 'Runner-Up' : 'Strong Alternative');
+    const isLowestCost = recLabel === 'Lowest Cost Option';
     const card = document.createElement('div');
-    card.className = `rec-card rank-${plan.rank}`;
+    card.className = `rec-card rank-${plan.rank}${isLowestCost ? ' lowest-cost' : ''}`;
     card.innerHTML = `
-      <div class="rec-rank-badge">${plan.rank}</div>
+      <div class="rec-rank-badge${isLowestCost ? ' lowest-cost-badge' : ''}">${recLabel}</div>
       <div class="rec-carrier">${escHtml(plan.carrier || 'Unknown Carrier')}</div>
       <div class="rec-plan-name">${escHtml(plan.planName || 'Unknown Plan')}</div>
 
@@ -407,8 +624,54 @@ function renderRecommendations(data) {
           <div class="rec-metric-value">${plan.copayPCP != null ? '$' + plan.copayPCP : '—'}</div>
         </div>
         <div class="rec-metric">
-          <div class="rec-metric-label">EE Premium/mo</div>
-          <div class="rec-metric-value">${plan.premiumEE != null ? '$' + Number(plan.premiumEE).toFixed(2) : '—'}</div>
+          <div class="rec-metric-label">Specialist</div>
+          <div class="rec-metric-value">${plan.copaySpecialist != null ? '$' + plan.copaySpecialist : '—'}</div>
+        </div>
+      </div>
+
+      <div class="rec-rates">
+        <div class="rec-rates-title">Composite Monthly Rates</div>
+        <div class="rec-rates-grid">
+          <div class="rec-rate-item">
+            <div class="rec-rate-label">EE Only</div>
+            <div class="rec-rate-value">${plan.premiumEE != null ? fmtCurrency(plan.premiumEE) : '—'}</div>
+          </div>
+          <div class="rec-rate-item">
+            <div class="rec-rate-label">EE + Spouse</div>
+            <div class="rec-rate-value">${plan.premiumES != null ? fmtCurrency(plan.premiumES) : '—'}</div>
+          </div>
+          <div class="rec-rate-item">
+            <div class="rec-rate-label">EE + Child</div>
+            <div class="rec-rate-value">${plan.premiumEC != null ? fmtCurrency(plan.premiumEC) : '—'}</div>
+          </div>
+          <div class="rec-rate-item">
+            <div class="rec-rate-label">Family</div>
+            <div class="rec-rate-value">${plan.premiumEF != null ? fmtCurrency(plan.premiumEF) : '—'}</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="rec-peremp">
+        <div class="rec-peremp-title">Per Employee Per Pay Period (${freqLabelMap[contribution.frequency] || 'Bi-Weekly'})</div>
+        <div class="rec-peremp-header">
+          <span></span>
+          <span class="rec-peremp-hdr-label">Employer</span>
+          <span class="rec-peremp-hdr-label">Employee</span>
+        </div>
+        ${perEmpRows}
+      </div>
+
+      <div class="rec-contribution">
+        <div class="rec-contrib-title">Aggregate Totals Per Pay Period</div>
+        <div class="rec-contrib-summary">
+          <div class="rec-contrib-pill">
+            <div class="rec-contrib-pill-label">Employer Total</div>
+            <div class="rec-contrib-pill-value">${fmtCurrency(contribution.employerPerPayTotal)}</div>
+          </div>
+          <div class="rec-contrib-pill">
+            <div class="rec-contrib-pill-label">Employee Total</div>
+            <div class="rec-contrib-pill-value">${fmtCurrency(contribution.employeePerPayTotal)}</div>
+          </div>
         </div>
       </div>
 
@@ -431,6 +694,7 @@ async function downloadPPTX() {
       caseId: state.caseId,
       clientName: document.getElementById('clientName').value || 'Client',
       effectiveDate: document.getElementById('effectiveDate').value || '',
+      contribution: state.contribution,
     });
     triggerDownload(blob, filename || 'BenefitsAnalysis.pptx');
     showLoading(false);
@@ -450,6 +714,7 @@ async function downloadXLSX() {
       caseId: state.caseId,
       clientName: document.getElementById('clientName').value || 'Client',
       effectiveDate: document.getElementById('effectiveDate').value || '',
+      contribution: state.contribution,
     });
     triggerDownload(blob, filename || 'BenefitsAnalysis.xlsx');
     showLoading(false);
@@ -523,6 +788,8 @@ function truncate(str, len) {
 (function init() {
   // Initialize census display
   updateCensus();
+  updateContributionSettings();
+  renderContributionSummary();
   // Sections that are hidden until data exists
   showSection('plansSection', false);
   showSection('recommendationsSection', false);

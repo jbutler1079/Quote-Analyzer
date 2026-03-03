@@ -3,6 +3,7 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const pdfParse = require('pdf-parse');
 const ExcelJS = require('exceljs');
@@ -12,8 +13,125 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
+const COVERAGE_TIERS = ['ee', 'es', 'ec', 'ef'];
+const PREMIUM_FIELD_BY_TIER = { ee: 'premiumEE', es: 'premiumES', ec: 'premiumEC', ef: 'premiumEF' };
+const PAY_PERIODS_PER_MONTH = {
+  weekly: 52 / 12,
+  biweekly: 26 / 12,
+  semimonthly: 24 / 12,
+  monthly: 1,
+};
+
 // ── In-memory store ──────────────────────────────────────────────────────────
 const caseStore = new Map(); // caseId → { files, plans, census, recommendations }
+
+function defaultContributionConfig() {
+  return {
+    payrollFrequency: 'biweekly',
+    tiers: {
+      ee: { type: 'percent', value: 0 },
+      es: { type: 'percent', value: 0 },
+      ec: { type: 'percent', value: 0 },
+      ef: { type: 'percent', value: 0 },
+    },
+  };
+}
+
+function normalizeContributionConfig(input) {
+  const defaults = defaultContributionConfig();
+  const freq = input && typeof input.payrollFrequency === 'string' ? input.payrollFrequency.toLowerCase() : defaults.payrollFrequency;
+  const payrollFrequency = Object.prototype.hasOwnProperty.call(PAY_PERIODS_PER_MONTH, freq) ? freq : defaults.payrollFrequency;
+
+  const tiers = {};
+  for (const tier of COVERAGE_TIERS) {
+    const rawTier = input && input.tiers ? input.tiers[tier] : null;
+    const type = rawTier && rawTier.type === 'dollar' ? 'dollar' : 'percent';
+    const rawValue = rawTier ? Number(rawTier.value) : 0;
+    const value = Number.isFinite(rawValue) && rawValue > 0 ? rawValue : 0;
+    tiers[tier] = { type, value };
+  }
+
+  return { payrollFrequency, tiers };
+}
+
+function calculatePlanCostShares(plan, census, contribution) {
+  const normalized = normalizeContributionConfig(contribution);
+  const payPeriodsPerMonth = PAY_PERIODS_PER_MONTH[normalized.payrollFrequency] || PAY_PERIODS_PER_MONTH.biweekly;
+
+  // Get EE base premium and EE rule for dependent surplus methodology
+  const eePremium = Number(plan[PREMIUM_FIELD_BY_TIER.ee]) || 0;
+  const eeRule = normalized.tiers.ee || { type: 'percent', value: 0 };
+
+  // Calculate how much employer covers at EE level (the base)
+  let eeBaseEmployer = 0;
+  if (eePremium > 0 && eeRule.value > 0) {
+    if (eeRule.type === 'dollar') {
+      eeBaseEmployer = Math.min(eePremium, eeRule.value);
+    } else {
+      eeBaseEmployer = eePremium * (Math.max(0, Math.min(100, eeRule.value)) / 100);
+    }
+  }
+
+  const byTier = {};
+  let employerMonthlyTotal = 0;
+  let employeeMonthlyTotal = 0;
+
+  for (const tier of COVERAGE_TIERS) {
+    const premiumField = PREMIUM_FIELD_BY_TIER[tier];
+    const premiumPerMemberMonthly = Number(plan[premiumField]) || 0;
+    const enrolled = Number(census[tier]) || 0;
+    const rule = normalized.tiers[tier] || { type: 'percent', value: 0 };
+
+    let employerPerMemberMonthly = 0;
+    if (premiumPerMemberMonthly > 0) {
+      if (tier === 'ee') {
+        // EE tier: straightforward — apply EE rule to EE premium
+        employerPerMemberMonthly = eeBaseEmployer;
+      } else {
+        // Dependent tiers: employer pays EE base + tier% of dependent surplus
+        // Dependent surplus = tier premium - EE premium (the additional cost for dependents)
+        const dependentSurplus = Math.max(0, premiumPerMemberMonthly - eePremium);
+        let surplusContribution = 0;
+        if (rule.value > 0 && dependentSurplus > 0) {
+          if (rule.type === 'dollar') {
+            surplusContribution = Math.min(dependentSurplus, rule.value);
+          } else {
+            surplusContribution = dependentSurplus * (Math.max(0, Math.min(100, rule.value)) / 100);
+          }
+        }
+        employerPerMemberMonthly = Math.min(premiumPerMemberMonthly, eeBaseEmployer + surplusContribution);
+      }
+    }
+
+    const employeePerMemberMonthly = Math.max(0, premiumPerMemberMonthly - employerPerMemberMonthly);
+    const employerMonthly = employerPerMemberMonthly * enrolled;
+    const employeeMonthly = employeePerMemberMonthly * enrolled;
+
+    employerMonthlyTotal += employerMonthly;
+    employeeMonthlyTotal += employeeMonthly;
+
+    byTier[tier] = {
+      enrolled,
+      premiumPerMemberMonthly,
+      employerPerMemberMonthly,
+      employeePerMemberMonthly,
+      employerMonthly,
+      employeeMonthly,
+      employerPerPay: employerMonthly / payPeriodsPerMonth,
+      employeePerPay: employeeMonthly / payPeriodsPerMonth,
+    };
+  }
+
+  return {
+    payrollFrequency: normalized.payrollFrequency,
+    payPeriodsPerMonth,
+    employerMonthlyTotal,
+    employeeMonthlyTotal,
+    employerPerPayTotal: employerMonthlyTotal / payPeriodsPerMonth,
+    employeePerPayTotal: employeeMonthlyTotal / payPeriodsPerMonth,
+    byTier,
+  };
+}
 
 // ── Multer (memory storage) ──────────────────────────────────────────────────
 const upload = multer({
@@ -36,22 +154,95 @@ const upload = multer({
   },
 });
 
-// ── Auth middleware ───────────────────────────────────────────────────────────
-const API_TOKEN = process.env.API_TOKEN || 'internal-token-2024';
-
-function authMiddleware(req, res, next) {
-  const token = req.headers['x-api-token'];
-  if (!token || token !== API_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized: invalid or missing X-API-Token' });
-  }
-  next();
-}
+// ── Auth middleware (disabled – internal tool) ───────────────────────────────
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+// ── Debug: extract plans from raw text (for testing without PDF) ──────────────
+app.post('/debug/extract', (req, res) => {
+  try {
+    const { text, sourceFile } = req.body;
+    if (!text) return res.status(400).json({ error: 'text required' });
+    const plans = extractPlanFromText(text, sourceFile || 'debug-input.txt');
+    res.json({ plans, count: plans.length });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Debug: see raw parsed text from uploaded PDF ──────────────────────────────
+app.post('/debug/parsetext', async (req, res) => {
+  try {
+    const { caseId } = req.body;
+    if (!caseId) return res.status(400).json({ error: 'caseId required' });
+    const caseData = caseStore.get(caseId);
+    if (!caseData) return res.status(404).json({ error: 'Case not found' });
+    const results = [];
+    for (const file of caseData.files) {
+      const ext = file.originalname.split('.').pop().toLowerCase();
+      if (ext === 'pdf') {
+        const data = await pdfParse(file.buffer);
+        results.push({ file: file.originalname, textLength: data.text.length, text: data.text });
+      }
+    }
+    res.json({ caseId, results });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Debug: upload a PDF and get raw text + per-page text ──────────────────────
+app.post('/debug/pdftext', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'file required' });
+    const data = await pdfParse(req.file.buffer);
+    const pages = data.text.split(/\f/);
+    res.json({
+      file: req.file.originalname,
+      totalLength: data.text.length,
+      numPages: pages.length,
+      pages: pages.map((p, i) => ({ page: i + 1, length: p.length, text: p })),
+      fullText: data.text.substring(0, 20000),
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Debug: dump raw text from latest case ─────────────────────────────────────
+app.get('/debug/latestcase', async (req, res) => {
+  try {
+    const entries = Array.from(caseStore.entries());
+    if (entries.length === 0) return res.status(404).json({ error: 'No cases in store' });
+    const [caseId, caseData] = entries[entries.length - 1];
+    const full = req.query.full === '1';
+    const results = [];
+    for (const file of caseData.files) {
+      const ext = file.originalname.split('.').pop().toLowerCase();
+      if (ext === 'pdf') {
+        const data = await pdfParse(file.buffer);
+        const pages = data.text.split(/\f/);
+        results.push({
+          file: file.originalname,
+          totalLength: data.text.length,
+          numPages: pages.length,
+          pages: pages.map((p, i) => ({
+            page: i + 1,
+            length: p.length,
+            ...(full ? { text: p } : { preview: p.substring(0, 1500) }),
+          })),
+        });
+      }
+    }
+    res.json({ caseId, numFiles: caseData.files.length, results });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Frontend static hosting ───────────────────────────────────────────────────
+const frontendDir = path.join(__dirname, '..', 'frontend');
+app.use(express.static(frontendDir));
+
+app.get('/', (_req, res) => {
+  res.sendFile(path.join(frontendDir, 'index.html'));
+});
+
 // ── Upload ────────────────────────────────────────────────────────────────────
-app.post('/upload', authMiddleware, upload.array('files[]', 20), (req, res) => {
+app.post('/upload', upload.array('files[]', 20), (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ error: 'No files uploaded' });
@@ -63,7 +254,13 @@ app.post('/upload', authMiddleware, upload.array('files[]', 20), (req, res) => {
       size: f.size,
       buffer: f.buffer,
     }));
-    caseStore.set(caseId, { files, plans: [], census: {}, recommendations: null });
+    caseStore.set(caseId, {
+      files,
+      plans: [],
+      census: {},
+      contribution: defaultContributionConfig(),
+      recommendations: null,
+    });
     res.json({
       caseId,
       files: files.map(f => ({ name: f.originalname, size: f.size, type: f.mimetype })),
@@ -90,42 +287,1322 @@ function firstMatch(text, patterns) {
   return null;
 }
 
+function allMatches(text, patterns) {
+  const results = [];
+  for (const re of patterns) {
+    const flags = re.flags.includes('g') ? re.flags : re.flags + 'g';
+    const gre = new RegExp(re.source, flags);
+    let m;
+    while ((m = gre.exec(text)) !== null) {
+      results.push(m[1] ? m[1].trim() : m[0].trim());
+    }
+  }
+  return results;
+}
+
+// ── Known carrier names for detection ─────────────────────────────────────────
+const KNOWN_CARRIERS = [
+  'Anthem', 'Aetna', 'Cigna', 'United\\s*Health(?:care)?', 'UHC', 'Kaiser',
+  'Blue\\s*Cross\\s*Blue\\s*Shield', 'BlueCross\\s*BlueShield', 'BCBS',
+  'Blue\\s*Cross', 'Blue\\s*Shield', 'Humana', 'Molina', 'Oscar', 'Centene',
+  'Wellmark', 'Harvard\\s*Pilgrim', 'Tufts', 'HCSC', 'Premera', 'Regence',
+  'Providence', 'Health\\s*Net', 'HealthNet', 'Coventry', 'WellCare',
+  'Magellan', 'Ambetter', 'CareFirst', 'Highmark', 'Florida\\s*Blue',
+  'Excellus', 'Independence', 'Medica', 'Priority\\s*Health', 'SelectHealth',
+  'Allina', 'HealthPartners', 'Dean\\s*Health', 'Geisinger', 'MVP',
+  'ConnectiCare', 'EmblemHealth', 'Oxford', 'AvMed'
+];
+const CARRIER_PATTERN = new RegExp('\\b(' + KNOWN_CARRIERS.join('|') + ')\\b', 'i');
+
 function extractPlanFromText(text, sourceFile) {
-  const plans = [];
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   const fullText = text;
 
-  // Detect network type occurrences to split into plan blocks if multiple
-  const networkPattern = /\b(HMO|PPO|EPO|HDHP|HSA)\b/gi;
-  const planNamePattern =
-    /(?:plan\s*name\s*[:\-]?\s*)([^\n]{3,60})|([A-Z][A-Za-z0-9 \-\/]*(HMO|PPO|EPO|HDHP|HSA)[A-Za-z0-9 \-\/]*)/gi;
+  console.log(`[EXTRACT] Starting extraction for "${sourceFile}" — ${lines.length} non-empty lines`);
 
-  // ── Attempt to find multiple plan blocks separated by plan names ──
-  const planBlocks = splitIntoPlanBlocks(lines, fullText);
-
-  for (const block of planBlocks) {
-    const plan = extractFieldsFromBlock(block, sourceFile);
-    if (plan) plans.push(plan);
+  // ── Quality scoring: pick the strategy that produces best data, not just most plans ──
+  // Uses AVERAGE benefit fields per plan so 3 complete plans beat 6 half-empty stubs.
+  function scoreStrategyResult(plans) {
+    if (!plans || plans.length === 0) return 0;
+    const BENEFIT_FIELDS = [
+      'deductibleIndividual', 'deductibleFamily',
+      'oopMaxIndividual', 'oopMaxFamily',
+      'copayPCP', 'copaySpecialist', 'copayER',
+      'premiumEE', 'premiumES', 'premiumEC', 'premiumEF',
+    ];
+    let totalBenefitFields = 0;
+    let plansWithBenefits = 0;
+    for (const p of plans) {
+      const benefitCount = BENEFIT_FIELDS.filter(f => p[f] !== null && p[f] !== undefined).length;
+      totalBenefitFields += benefitCount;
+      if (benefitCount >= 2) plansWithBenefits++;
+    }
+    // Average benefit fields per plan × number of plans that have real data
+    const avgBenefits = totalBenefitFields / plans.length;
+    // Reward: more plans WITH actual benefit data, penalize empty stubs
+    return avgBenefits * plansWithBenefits;
   }
 
-  // fallback: if nothing parsed, create one plan from full text
+  // Collect results from ALL strategies
+  const candidates = [];
+
+  // ── Strategy 1: Find all distinct plan names in text, split into blocks ──
+  try {
+    const planNamePlans = extractByPlanNames(text, lines, sourceFile);
+    if (planNamePlans.length > 0) {
+      const score = scoreStrategyResult(planNamePlans);
+      console.log(`[EXTRACT] Strategy 1 (plan names): ${planNamePlans.length} plans, score=${score}`);
+      candidates.push({ name: 'plan names', plans: planNamePlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 1 error: ${e.message}`); }
+
+  // ── Strategy 2: Benefit comparison grid ─────────────────────────────────
+  try {
+    const gridPlans = extractFromBenefitGrid(text, sourceFile);
+    if (gridPlans.length > 0) {
+      const score = scoreStrategyResult(gridPlans);
+      console.log(`[EXTRACT] Strategy 2 (benefit grid): ${gridPlans.length} plans, score=${score}`);
+      candidates.push({ name: 'benefit grid', plans: gridPlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 2 error: ${e.message}`); }
+
+  // ── Strategy 3: Table-based extraction (rate sheets) ────────────────────
+  try {
+    const tablePlans = extractFromTable(lines, fullText, sourceFile);
+    if (tablePlans.length > 0) {
+      const score = scoreStrategyResult(tablePlans);
+      console.log(`[EXTRACT] Strategy 3 (rate table): ${tablePlans.length} plans, score=${score}`);
+      candidates.push({ name: 'rate table', plans: tablePlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 3 error: ${e.message}`); }
+
+  // ── Strategy 4: Page-based splitting ────────────────────────────────────
+  try {
+    const pages = text.split(/\f/).filter(p => p.trim().length > 50);
+    if (pages.length > 1) {
+      const pagePlans = [];
+      for (const page of pages) {
+        const plan = extractFieldsFromBlock(page, sourceFile);
+        if (plan) pagePlans.push(plan);
+      }
+      if (pagePlans.length > 0) {
+        const score = scoreStrategyResult(pagePlans);
+        console.log(`[EXTRACT] Strategy 4 (pages): ${pagePlans.length} plans from ${pages.length} pages, score=${score}`);
+        candidates.push({ name: 'pages', plans: pagePlans, score });
+      }
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 4 error: ${e.message}`); }
+
+  // ── Strategy 5: Plan-block-based extraction (SBC / summary layouts) ─────
+  try {
+    const planBlocks = splitIntoPlanBlocks(lines, fullText);
+    if (planBlocks.length > 1) {
+      const blockPlans = [];
+      for (const block of planBlocks) {
+        const plan = extractFieldsFromBlock(block, sourceFile);
+        if (plan) blockPlans.push(plan);
+      }
+      if (blockPlans.length > 0) {
+        const score = scoreStrategyResult(blockPlans);
+        console.log(`[EXTRACT] Strategy 5 (blocks): ${blockPlans.length} plans from ${planBlocks.length} blocks, score=${score}`);
+        candidates.push({ name: 'blocks', plans: blockPlans, score });
+      }
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 5 error: ${e.message}`); }
+
+  // ── Strategy 6: Repeated benefit keywords ─────────────────────────────────
+  try {
+    const repPlans = extractByRepeatedKeywords(text, lines, sourceFile);
+    if (repPlans.length > 0) {
+      const score = scoreStrategyResult(repPlans);
+      console.log(`[EXTRACT] Strategy 6 (repeated keywords): ${repPlans.length} plans, score=${score}`);
+      candidates.push({ name: 'repeated keywords', plans: repPlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 6 error: ${e.message}`); }
+
+  // ── Strategy 7: Plan code benefit rows (BSW-style) ────────────────────────
+  try {
+    const codeRowPlans = extractFromPlanCodeBenefitRows(text, sourceFile);
+    if (codeRowPlans.length > 0) {
+      const score = scoreStrategyResult(codeRowPlans);
+      console.log(`[EXTRACT] Strategy 7 (plan code rows): ${codeRowPlans.length} plans, score=${score}`);
+      candidates.push({ name: 'plan code benefit rows', plans: codeRowPlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 7 error: ${e.message}`); }
+
+  // ── Pick the best strategy by quality score ─────────────────────────────
+  let plans = [];
+  if (candidates.length > 0) {
+    candidates.sort((a, b) => b.score - a.score);
+    const best = candidates[0];
+    console.log(`[EXTRACT] Winner: "${best.name}" with ${best.plans.length} plans, score=${best.score}`);
+    plans = best.plans;
+  }
+
+  // ── Strategy 7: Fallback — entire text as one block ─────────────────────
   if (plans.length === 0) {
     const plan = extractFieldsFromBlock(lines.join('\n'), sourceFile);
-    if (plan) plans.push(plan);
+    if (plan) {
+      console.log(`[EXTRACT] Strategy 7 (fallback): extracted 1 plan from entire text`);
+      plans.push(plan);
+    }
+  }
+
+  // ── Post-extraction: clean plan names ───────────────────────────────────
+  for (const plan of plans) {
+    plan.planName = cleanPlanName(plan.planName);
+  }
+
+  // ── Post-extraction: enrich plans with missing benefit fields ───────────
+  enrichPlansFromText(plans, fullText);
+
+  // ── Post-extraction: apply carrier from full text if not found per-plan ─
+  const globalCarrier = detectCarrier(fullText, sourceFile);
+  for (const plan of plans) {
+    if (!plan.carrier && globalCarrier) plan.carrier = globalCarrier;
+  }
+
+  // De-duplicate plans that have the same planName + carrier
+  plans = deduplicatePlans(plans);
+
+  console.log(`[EXTRACT] Final result: ${plans.length} plans`);
+  return plans;
+}
+
+// ── Clean plan name: strip headers, embedded newlines, common prefixes ────────
+function cleanPlanName(name) {
+  if (!name) return name;
+  // Remove "Illustrative Quote" header prefix (appears in BCBS TX PDFs)
+  let cleaned = name.replace(/^(?:Illustrative\s*)?Quote\s*/i, '');
+  // Collapse newlines and multiple spaces
+  cleaned = cleaned.replace(/[\r\n]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+
+  // Remove carrier boilerplate prefix ("BlueCross BlueShield of Texas", "Anthem", etc.)
+  // Only if there's a meaningful plan descriptor after it
+  const carrierPrefixRe = new RegExp('^(?:' + KNOWN_CARRIERS.join('|') + ')\\s+(?:of\\s+\\w+\\s+)?', 'i');
+  const withoutCarrier = cleaned.replace(carrierPrefixRe, '').trim();
+  if (withoutCarrier.length > 5 && /[A-Z]/i.test(withoutCarrier)) {
+    cleaned = withoutCarrier;
+  }
+
+  // Remove standalone alphanumeric plan code suffix at end (e.g., "B661ADTHMO", "S9E1ADTHMO")
+  // These are internal BCBS codes that appear on their own word at the end
+  cleaned = cleaned.replace(/\s+[A-Z0-9]{6,12}(?:HMO|PPO|EPO|HDHP)?$/i, '').trim();
+
+  return cleaned || name;
+}
+
+// ── Strategy 1: Extract by finding all plan names, then building context ──────
+// Scans text for all distinct plan-name-like strings, then for each plan name,
+// looks within a context window for benefit values.
+function extractByPlanNames(text, lines, sourceFile) {
+  // Find all plan name occurrences in the text
+  const planNamePatterns = [
+    /([A-Z][A-Za-z0-9\s\/\-&']{2,50}?(?:HMO|PPO|EPO|HDHP|HSA)\s*(?:Gold|Silver|Bronze|Platinum)?[A-Za-z0-9\s\/\-&']{0,20})/g,
+    /([A-Z][A-Za-z0-9\s\/\-&']{2,50}?(?:Gold|Silver|Bronze|Platinum)\s*(?:HMO|PPO|EPO|HDHP|HSA)?[A-Za-z0-9\s\/\-&']{0,20})/g,
+    // Also catch carrier-prefixed plan names with plan numbers/codes
+    new RegExp('(' + KNOWN_CARRIERS.join('|') + ')\\s+[A-Za-z0-9\\s\\/\\-&\']{3,50}', 'gi'),
+  ];
+
+  // Collect all candidate plan names with their line positions
+  const candidates = [];
+  for (let i = 0; i < lines.length; i++) {
+    for (const pattern of planNamePatterns) {
+      pattern.lastIndex = 0;
+      let m;
+      while ((m = pattern.exec(lines[i])) !== null) {
+        const name = m[1].trim();
+        // Filter out noise: skip if too short, too long, or looks like a label
+        if (name.length < 6 || name.length > 80) continue;
+        if (/^(deductible|copay|premium|coinsurance|out.of.pocket|oop|maximum|benefit|coverage|plan\s*type)/i.test(name)) continue;
+        candidates.push({ name, lineIndex: i, text: lines[i] });
+      }
+    }
+  }
+
+  if (candidates.length === 0) return [];
+
+  // Deduplicate plan names — group similar names
+  const uniqueNames = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    const normalized = c.name.toLowerCase().replace(/\s+/g, ' ').trim();
+    if (seen.has(normalized)) continue;
+    // Also check for substring matches
+    let isDupe = false;
+    for (const s of seen) {
+      if (s.includes(normalized) || normalized.includes(s)) { isDupe = true; break; }
+    }
+    if (isDupe) continue;
+    seen.add(normalized);
+    uniqueNames.push(c);
+  }
+
+  console.log(`[EXTRACT] Plan name candidates: ${uniqueNames.map(u => u.name).join(' | ')}`);
+
+  if (uniqueNames.length <= 1) return [];
+
+  // For each unique plan name, build a context window and extract fields
+  const plans = [];
+  for (let u = 0; u < uniqueNames.length; u++) {
+    const { name, lineIndex } = uniqueNames[u];
+    // Context: from this plan name to the next plan name (or end of text)
+    const nextLineIndex = u + 1 < uniqueNames.length ? uniqueNames[u + 1].lineIndex : lines.length;
+    // Also look a few lines before the plan name for context
+    const startLine = Math.max(0, lineIndex - 2);
+    const blockLines = lines.slice(startLine, nextLineIndex);
+    const blockText = blockLines.join('\n');
+
+    const plan = extractFieldsFromBlock(blockText, sourceFile);
+    if (plan) {
+      // Override plan name with the one we found
+      if (!plan.planName || plan.planName.length < name.length) {
+        plan.planName = name;
+      }
+      plans.push(plan);
+    }
   }
 
   return plans;
 }
 
+// ── Strategy 7: Plan code benefit rows ────────────────────────────────────────
+// Handles PDFs where each line is a plan-code followed by concatenated benefit
+// data.  Common in BSW (Baylor Scott & White) and similar carriers that produce
+// benefit-comparison tables with columns: Code | Deductible | PCP/Specialist |
+// Coinsurance | OOP Max.  PDF extraction concatenates the cells, giving lines
+// like: PHG26P44$1,000$5 / $2020% copayment after deductible$3,600
+
+/**
+ * Split concatenated specialist-copay + coinsurance digits.
+ * E.g. "2020" → { spec: 20, coins: 20 }, "250" → { spec: 25, coins: 0 }
+ */
+function splitSpecCoins(combined) {
+  const candidates = [];
+  for (let i = 1; i < combined.length; i++) {
+    const spec = parseInt(combined.slice(0, i), 10);
+    const coins = parseInt(combined.slice(i), 10);
+    if (isNaN(spec) || isNaN(coins)) continue;
+    if (coins >= 0 && coins <= 50 && coins % 5 === 0 && spec >= 0 && spec <= 200) {
+      candidates.push({ spec, coins });
+    }
+  }
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+  // Prefer candidates with specialist in typical range ($5-$150), pick largest specialist
+  const typical = candidates.filter(c => c.spec >= 5 && c.spec <= 150);
+  if (typical.length > 0) {
+    typical.sort((a, b) => b.spec - a.spec);
+    return typical[0];
+  }
+  candidates.sort((a, b) => b.spec - a.spec);
+  return candidates[0];
+}
+
+function extractFromPlanCodeBenefitRows(text, sourceFile) {
+  const lines = text.split('\n');
+  const plans = [];
+
+  // BSW-style codes: [Metal][Net]G[YY][SubNet][Num]
+  const PLAN_CODE_RE = /^([PGBS][HP]G\d{2}[A-Z](?:\d{2,3}|IV))/;
+
+  const METAL_MAP = { P: 'Platinum', G: 'Gold', S: 'Silver', B: 'Bronze' };
+  const NET_MAP   = { H: 'HMO', P: 'PPO' };
+  const SUBNET_MAP = { P: 'BSW Premier', A: 'BSW Access', D: 'BSW Plus' };
+
+  // Detect carrier
+  let carrier = null;
+  if (/baylor\s*scott\s*(?:&|and)\s*white/i.test(text)) carrier = 'Baylor Scott & White';
+
+  // Regex for premium line: $EE$ES$EC$EF$Total (5 dollar amounts with decimals)
+  const PREMIUM_LINE_RE = /^\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})$/;
+  // Regex for Rx tier line: $3/$50/$125/$250 etc
+  const RX_LINE_RE = /^\$(\d+)\/\$(\d+)\/\$(\d+)\/\$(\d+)$/;
+
+  /**
+   * Look ahead from the plan code line to find Rx tiers and premiums.
+   * In the BSW format, the sequence after a plan code line is:
+   *   [optional Rx line like "$3/$50/$125/$250"]
+   *   [optional "0% copayment after" / "deductible" for HSA]
+   *   [premium line like "$825.02$1,650.04$1,650.04$2,475.06$7,425.14"]
+   */
+  function lookAheadForPremiums(startIdx) {
+    const result = { premiumEE: null, premiumES: null, premiumEC: null, premiumEF: null,
+                     rxTier1: null, rxTier2: null, rxTier3: null };
+    // Search the next 5 lines for premium and Rx data
+    for (let j = startIdx + 1; j < Math.min(startIdx + 6, lines.length); j++) {
+      const ahead = lines[j].trim();
+      if (!ahead) continue;
+
+      // Stop if we hit another plan code line or a section header
+      if (PLAN_CODE_RE.test(ahead)) break;
+
+      // Check for Rx tier line
+      const rxMatch = RX_LINE_RE.exec(ahead);
+      if (rxMatch) {
+        result.rxTier1 = parseInt(rxMatch[1], 10);
+        result.rxTier2 = parseInt(rxMatch[2], 10);
+        result.rxTier3 = parseInt(rxMatch[3], 10);
+        continue;
+      }
+
+      // Check for premium line (5 dollar amounts with cents)
+      const premMatch = PREMIUM_LINE_RE.exec(ahead);
+      if (premMatch) {
+        result.premiumEE = parseMoney(premMatch[1]);
+        result.premiumES = parseMoney(premMatch[2]);
+        result.premiumEC = parseMoney(premMatch[3]);
+        result.premiumEF = parseMoney(premMatch[4]);
+        break; // Found premiums, stop looking
+      }
+
+      // Skip "0% copayment after" / "deductible" / "Total Monthly" / "Premium" continuations
+      if (/^(0%|deductible|total\s*monthly|premium)/i.test(ahead)) continue;
+
+      // If it's a recognizable section header (e.g. "HMO Gold Plans"), stop
+      if (/^(HMO|PPO|BSW|Composite|Group|Plan)\b/i.test(ahead)) break;
+    }
+    return result;
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const codeMatch = PLAN_CODE_RE.exec(line);
+    if (!codeMatch) continue;
+
+    const code = codeMatch[1];
+    const rest = line.substring(code.length);
+    if (!rest.startsWith('$')) continue;
+
+    const metalCode = code[0], netCode = code[1];
+    const subMatch = code.match(/G\d{2}([A-Z])/);
+    const subNetCode = subMatch ? subMatch[1] : null;
+    const metal = METAL_MAP[metalCode] || null;
+    const network = NET_MAP[netCode] || null;
+    const subNetwork = subNetCode ? (SUBNET_MAP[subNetCode] || null) : null;
+
+    // Look ahead for premiums and Rx
+    const extras = lookAheadForPremiums(i);
+
+    // --- HSA format: $DED0% AD / 0% AD0% copayment after deductible$OOP ---
+    const hsaRe = /^\$(\d{1,3}(?:,\d{3})*)0%\s*AD\s*\/\s*0%\s*AD\s*0%\s*co(?:payment|insurance)\s+after\s+deductible\$([\d,]+)/;
+    const hsaMatch = hsaRe.exec(rest);
+    if (hsaMatch) {
+      const ded = parseMoney(hsaMatch[1]);
+      const oop = parseMoney(hsaMatch[2]);
+      const hasPremiums = extras.premiumEE != null;
+      const benefitCount = [ded, oop].filter(v => v != null).length + (hasPremiums ? 4 : 0);
+
+      plans.push({
+        id: uuidv4(), carrier,
+        planName: `${metal} ${network} HSA $${ded.toLocaleString()}${subNetwork ? ' (' + subNetwork + ')' : ''}`,
+        planCode: code, networkType: network, metalLevel: metal,
+        deductibleIndividual: ded, deductibleFamily: null,
+        oopMaxIndividual: oop, oopMaxFamily: null,
+        coinsurance: '0% after deductible',
+        copayPCP: null, copaySpecialist: null,
+        copayUrgentCare: null, copayER: null,
+        rxDeductible: null,
+        rxTier1: extras.rxTier1, rxTier2: extras.rxTier2, rxTier3: extras.rxTier3,
+        premiumEE: extras.premiumEE, premiumES: extras.premiumES,
+        premiumEC: extras.premiumEC, premiumEF: extras.premiumEF,
+        effectiveDate: null, ratingArea: null, underwritingNotes: null,
+        extractionConfidence: Math.min(1, 0.4 + (benefitCount * 0.1)),
+        sourceFile,
+      });
+      continue;
+    }
+
+    // --- Standard format: $DED$PCP [AD] / $SPEC_COINS% copay... $OOP ---
+    const stdRe = /^\$([\d,]+)\$(\d+)\s*(?:AD\s*)?\/\s*\$(.+?)%\s*co(?:payment|insurance)(?:\s+after\s+deductible)?\$([\d,]+)/;
+    const stdMatch = stdRe.exec(rest);
+    if (!stdMatch) continue;
+
+    const ded = parseMoney(stdMatch[1]);
+    const pcp = parseInt(stdMatch[2], 10);
+    const specCoinsRaw = stdMatch[3].trim();
+    const oop = parseMoney(stdMatch[4]);
+
+    let spec = null, coins = null;
+    const adSplit = specCoinsRaw.match(/^(\d+)\s*AD\s*(\d+)$/);
+    if (adSplit) {
+      spec = parseInt(adSplit[1], 10);
+      coins = parseInt(adSplit[2], 10);
+    } else {
+      const pureDigits = specCoinsRaw.replace(/\s+/g, '');
+      if (/^\d+$/.test(pureDigits)) {
+        const result = splitSpecCoins(pureDigits);
+        if (result) { spec = result.spec; coins = result.coins; }
+      }
+    }
+
+    let planName;
+    if (ded === 0 && coins != null) {
+      planName = `${metal} ${network} Copay $0/${oop != null ? '$' + oop.toLocaleString() + ' OOP' : ''}`;
+    } else {
+      const planPays = coins != null ? (100 - coins) : '?';
+      planName = `${metal} ${network} ${planPays} $${ded.toLocaleString()} Ded`;
+    }
+    if (subNetwork) planName += ` (${subNetwork})`;
+
+    const hasPremiums = extras.premiumEE != null;
+    const benefitFields = [ded, oop, pcp, spec].filter(v => v != null).length + (hasPremiums ? 4 : 0);
+
+    plans.push({
+      id: uuidv4(), carrier,
+      planName, planCode: code, networkType: network, metalLevel: metal,
+      deductibleIndividual: ded, deductibleFamily: null,
+      oopMaxIndividual: oop, oopMaxFamily: null,
+      coinsurance: coins != null ? `${coins}%` : null,
+      copayPCP: pcp, copaySpecialist: spec,
+      copayUrgentCare: null, copayER: null,
+      rxDeductible: null,
+      rxTier1: extras.rxTier1, rxTier2: extras.rxTier2, rxTier3: extras.rxTier3,
+      premiumEE: extras.premiumEE, premiumES: extras.premiumES,
+      premiumEC: extras.premiumEC, premiumEF: extras.premiumEF,
+      effectiveDate: null, ratingArea: null, underwritingNotes: null,
+      extractionConfidence: Math.min(1, 0.4 + (benefitFields * 0.075)),
+      sourceFile,
+    });
+  }
+
+  if (plans.length < 3) return [];
+  console.log(`[EXTRACT] Plan code rows: found ${plans.length} plans from code-prefixed lines`);
+  return plans;
+}
+
+// ── Strategy 6: Repeated-keyword extraction ───────────────────────────────────
+// If the same benefit keyword (e.g., "deductible") appears multiple times in the
+// text, each time followed by a dollar amount, that likely means the PDF text was
+// extracted column-by-column (one plan at a time).  Each Nth occurrence of each
+// keyword belongs to plan N.
+function extractByRepeatedKeywords(text, lines, sourceFile) {
+  const DOLLAR_RE = /\$\s*([\d,]+(?:\.\d{1,2})?)/;
+
+  // Benefit keywords to look for — each may appear once per plan
+  const benefitDefs = [
+    { field: 'deductibleIndividual', re: /deductible/i, exclude: /family|rx|pharm|drug/i },
+    { field: 'oopMaxIndividual', re: /out[\s-]*of[\s-]*pocket|oop|moop/i, exclude: /family/i },
+    { field: 'copayPCP', re: /pcp|primary\s*care|office\s*visit/i },
+    { field: 'copaySpecialist', re: /specialist/i },
+    { field: 'copayER', re: /emergency/i },
+    { field: 'premiumEE', re: /employee\s*only|emp\s*only|\bee\b(?!\+)|single/i, exclude: /spouse|child|family/i },
+    { field: 'premiumES', re: /emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp)|\bes\b/i },
+    { field: 'premiumEC', re: /emp(?:loyee)?\s*[\+\/&]\s*(?:child|ch)|\bec\b/i },
+    { field: 'premiumEF', re: /\bfamily\b|\bef\b/i, exclude: /deductible|oop|out.of.pocket|family.*deductible/i },
+  ];
+
+  // For each benefit keyword, find all lines that have it + a dollar amount
+  const fieldOccurrences = {};
+  let maxOccurrences = 0;
+  for (const { field, re, exclude } of benefitDefs) {
+    const values = [];
+    for (const line of lines) {
+      if (!re.test(line)) continue;
+      if (exclude && exclude.test(line)) continue;
+      const dm = line.match(DOLLAR_RE);
+      if (dm) {
+        values.push(parseMoney(dm[1]));
+      }
+    }
+    fieldOccurrences[field] = values;
+    if (values.length > maxOccurrences) maxOccurrences = values.length;
+  }
+
+  // We need at least 2 occurrences of some benefit keyword, and ideally
+  // multiple keywords all repeating the same number of times
+  if (maxOccurrences < 2) return [];
+
+  // Determine numPlans: the most common repetition count >= 2
+  const repCounts = {};
+  for (const values of Object.values(fieldOccurrences)) {
+    if (values.length >= 2) {
+      repCounts[values.length] = (repCounts[values.length] || 0) + 1;
+    }
+  }
+  let numPlans = maxOccurrences;
+  let bestVotes = 0;
+  for (const [cnt, votes] of Object.entries(repCounts)) {
+    if (votes > bestVotes || (votes === bestVotes && Number(cnt) > numPlans)) {
+      numPlans = Number(cnt);
+      bestVotes = votes;
+    }
+  }
+
+  console.log(`[EXTRACT] Repeated-keyword detection: numPlans=${numPlans}, maxOccurrences=${maxOccurrences}`);
+  console.log(`[EXTRACT] Field occurrences:`, Object.fromEntries(Object.entries(fieldOccurrences).map(([k, v]) => [k, v.length])));
+
+  // Build plans
+  const plans = [];
+  for (let p = 0; p < numPlans; p++) {
+    const plan = {
+      id: uuidv4(),
+      carrier: null, planName: `Plan ${p + 1}`, planCode: null,
+      networkType: null, metalLevel: null,
+      deductibleIndividual: null, deductibleFamily: null,
+      oopMaxIndividual: null, oopMaxFamily: null,
+      coinsurance: null, copayPCP: null, copaySpecialist: null,
+      copayUrgentCare: null, copayER: null,
+      rxDeductible: null, rxTier1: null, rxTier2: null, rxTier3: null,
+      premiumEE: null, premiumES: null, premiumEC: null, premiumEF: null,
+      effectiveDate: null, ratingArea: null, underwritingNotes: null,
+      extractionConfidence: 0, sourceFile,
+    };
+
+    for (const [field, values] of Object.entries(fieldOccurrences)) {
+      if (values.length >= numPlans && values[p] != null) {
+        plan[field] = values[p];
+      }
+    }
+    plans.push(plan);
+  }
+
+  // Try to find plan names — look for lines matching plan-name patterns
+  // that appear before or near each plan's data
+  const allNames = [];
+  for (const line of lines) {
+    const names = findPlanNamesInLine(line);
+    for (const n of names) {
+      if (!allNames.find(a => a.name === n.name)) allNames.push(n);
+    }
+  }
+  for (let p = 0; p < numPlans && p < allNames.length; p++) {
+    plans[p].planName = allNames[p].name;
+    if (allNames[p].network) plans[p].networkType = allNames[p].network;
+    if (allNames[p].metal) plans[p].metalLevel = allNames[p].metal;
+  }
+
+  // Filter: at least 2 non-null key fields
+  return plans.filter(p => {
+    const kf = [p.carrier, p.planName, p.networkType, p.deductibleIndividual,
+                p.oopMaxIndividual, p.copayPCP, p.premiumEE, p.premiumES, p.premiumEC, p.premiumEF];
+    const found = kf.filter(v => v !== null && v !== undefined).length;
+    p.extractionConfidence = Math.min(1, found / 6);
+    return found >= 2;
+  });
+}
+
+// ── Benefit comparison grid extractor ─────────────────────────────────────────
+// Detects common carrier quote format:
+//   Row labels (Deductible, OOP Max, Copay, etc.) in first "column", and
+//   dollar amounts aligned in subsequent columns — one column per plan.
+// Also handles the "$X / $Y" individual/family pair format.
+function extractFromBenefitGrid(text, sourceFile) {
+  const lines = text.split('\n');
+
+  // Identify "benefit label" lines that contain both a recognizable label
+  // and at least one dollar amount.
+  const BENEFIT_LABEL_RE = /deductible|out[\s-]*of[\s-]*pocket|oop|copay|co-?pay|coinsurance|premium|office\s*visit|pcp|primary\s*care|specialist|emergency|urgent\s*care|generic|preferred\s*brand|non[\s-]*preferred|tier\s*[123]|rx|pharmacy|moop|max(?:imum)?\s*out/i;
+  const DOLLAR_RE = /\$\s*[\d,]+(?:\.\d{1,2})?/g;
+  const TIER_LABEL_RE = /\b(?:employee\s*only|emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp|child(?:ren)?|ch|family|fam)|single|ee|es|ec|ef|family)\b/i;
+
+  // Helper: detect "$X / $Y" pairs vs standalone dollar amounts
+  const PAIR_RE = /\$\s*([\d,]+(?:\.\d{1,2})?)\s*[\/|]\s*\$\s*([\d,]+(?:\.\d{1,2})?)/g;
+  function parseDollarGroups(line) {
+    // First detect "$X / $Y" pairs
+    const pairs = [];
+    let pm;
+    const pairRe = new RegExp(PAIR_RE.source, 'g');
+    while ((pm = pairRe.exec(line)) !== null) {
+      pairs.push({ primary: parseMoney(pm[1]), secondary: parseMoney(pm[2]), fullMatch: pm[0] });
+    }
+    if (pairs.length > 0) {
+      return { type: 'pairs', count: pairs.length, primary: pairs.map(p => p.primary), secondary: pairs.map(p => p.secondary), all: pairs };
+    }
+    // No pairs — extract standalone amounts
+    const amounts = (line.match(DOLLAR_RE) || []).map(s => parseMoney(s)).filter(v => v != null);
+    return { type: 'singles', count: amounts.length, primary: amounts, secondary: [], all: amounts };
+  }
+
+  // Pass 1: find lines with a benefit label and dollar amounts
+  // Also check the next 1-3 lines if the label line has no dollar amounts
+  const labeledRows = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!BENEFIT_LABEL_RE.test(line) && !TIER_LABEL_RE.test(line)) continue;
+    let groups = parseDollarGroups(line);
+    // If the label line has no dollar amounts, check the next 1-3 lines
+    if (groups.count === 0) {
+      for (let j = 1; j <= 3 && i + j < lines.length; j++) {
+        const nextLine = lines[i + j];
+        if (BENEFIT_LABEL_RE.test(nextLine) || TIER_LABEL_RE.test(nextLine)) break;
+        const nextGroups = parseDollarGroups(nextLine);
+        if (nextGroups.count > 0) {
+          groups = nextGroups;
+          break;
+        }
+      }
+    }
+    if (groups.count === 0) continue;
+    labeledRows.push({ index: i, line, groups, label: line });
+  }
+
+  if (labeledRows.length < 1) {
+    console.log(`[GRID] Only ${labeledRows.length} labeled rows found — skipping grid strategy`);
+    return [];
+  }
+
+  console.log(`[GRID] Found ${labeledRows.length} labeled rows:`, labeledRows.map(r => ({ label: r.line.substring(0, 60), count: r.groups.count, type: r.groups.type })));
+
+  // Find the number of plans from column counts
+  // Use "groups.count" (which handles $X/$Y pairs as 1 group)
+  const countFreq = {};
+  for (const r of labeledRows) {
+    const c = r.groups.count;
+    if (c >= 1) countFreq[c] = (countFreq[c] || 0) + 1;
+  }
+  console.log(`[GRID] Column count frequency:`, countFreq);
+
+  // Pick numPlans: prefer the highest count with freq >= 2, else highest count with freq >= 1
+  let numPlans = 1;
+  const countsWithFreq2 = Object.entries(countFreq)
+    .filter(([cnt, freq]) => Number(cnt) >= 2 && freq >= 1)
+    .map(([cnt]) => Number(cnt));
+  if (countsWithFreq2.length > 0) {
+    // Among counts >= 2, prefer the one with the highest frequency; break ties by higher count
+    let bestCount = 0, bestFreq = 0;
+    for (const [cnt, freq] of Object.entries(countFreq)) {
+      const n = Number(cnt);
+      if (n < 2) continue;
+      if (freq > bestFreq || (freq === bestFreq && n > bestCount)) {
+        bestCount = n;
+        bestFreq = freq;
+      }
+    }
+    numPlans = bestCount;
+  } else if (countFreq[1] && countFreq[1] >= 2) {
+    // Multiple rows with 1 amount each — might be sequential per-plan layout
+    numPlans = 1;
+  }
+
+  if (numPlans < 1) return [];
+
+  // Build plan stubs
+  const planData = [];
+  for (let p = 0; p < numPlans; p++) {
+    planData.push({
+      id: uuidv4(),
+      carrier: null, planName: null, planCode: null,
+      networkType: null, metalLevel: null,
+      deductibleIndividual: null, deductibleFamily: null,
+      oopMaxIndividual: null, oopMaxFamily: null,
+      coinsurance: null, copayPCP: null, copaySpecialist: null,
+      copayUrgentCare: null, copayER: null,
+      rxDeductible: null, rxTier1: null, rxTier2: null, rxTier3: null,
+      premiumEE: null, premiumES: null, premiumEC: null, premiumEF: null,
+      effectiveDate: null, ratingArea: null, underwritingNotes: null,
+      extractionConfidence: 0, sourceFile,
+    });
+  }
+
+  // Try to find plan name header row (line before first labeled row with plan-like names)
+  const firstLabelIdx = labeledRows[0].index;
+  for (let j = Math.max(0, firstLabelIdx - 15); j < firstLabelIdx; j++) {
+    const hLine = lines[j];
+    const names = findPlanNamesInLine(hLine);
+    if (names.length >= numPlans) {
+      for (let p = 0; p < numPlans && p < names.length; p++) {
+        planData[p].planName = names[p].name;
+        if (names[p].network) planData[p].networkType = names[p].network;
+        if (names[p].metal) planData[p].metalLevel = names[p].metal;
+      }
+      break;
+    }
+  }
+
+  // If no plan names found from header, try to find them via other patterns
+  if (!planData[0].planName) {
+    // Look for plan names anywhere in the first ~30 lines
+    for (let j = 0; j < Math.min(30, lines.length); j++) {
+      const names = findPlanNamesInLine(lines[j]);
+      if (names.length >= numPlans) {
+        for (let p = 0; p < numPlans && p < names.length; p++) {
+          planData[p].planName = names[p].name;
+          if (names[p].network) planData[p].networkType = names[p].network;
+          if (names[p].metal) planData[p].metalLevel = names[p].metal;
+        }
+        break;
+      }
+    }
+    // Fallback names
+    for (let p = 0; p < numPlans; p++) {
+      if (!planData[p].planName) planData[p].planName = `Plan ${p + 1}`;
+    }
+  }
+
+  // Map labeled rows to plan fields
+  for (const row of labeledRows) {
+    const lbl = row.label.toLowerCase();
+    const amounts = row.groups.primary;
+    const secondaryAmounts = row.groups.secondary || [];
+    const isPair = row.groups.type === 'pairs';
+
+    // Determine what benefit this row describes
+    const assignAllPlans = (field) => {
+      for (let p = 0; p < numPlans; p++) {
+        if (p < amounts.length && amounts[p] != null && planData[p][field] == null) {
+          planData[p][field] = amounts[p];
+        }
+      }
+    };
+
+    const assignSecondary = (field) => {
+      for (let p = 0; p < numPlans; p++) {
+        if (p < secondaryAmounts.length && secondaryAmounts[p] != null && planData[p][field] == null) {
+          planData[p][field] = secondaryAmounts[p];
+        }
+      }
+    };
+
+    // Deductible (individual — primary; family — secondary if "$X / $Y" pair)
+    if (/deductible/i.test(lbl) && !/rx|pharm|drug/i.test(lbl)) {
+      if (/family/i.test(lbl)) {
+        assignAllPlans('deductibleFamily');
+      } else {
+        assignAllPlans('deductibleIndividual');
+        if (isPair) {
+          assignSecondary('deductibleFamily');
+        } else if (numPlans === 1 && amounts.length === 2 && !(/family/i.test(lbl))) {
+          planData[0].deductibleIndividual = amounts[0];
+          planData[0].deductibleFamily = amounts[1];
+        }
+      }
+    }
+    // OOP Max
+    else if (/out[\s-]*of[\s-]*pocket|oop|moop/i.test(lbl) || /max(?:imum)?\s*out/i.test(lbl)) {
+      if (/family/i.test(lbl)) {
+        assignAllPlans('oopMaxFamily');
+      } else {
+        assignAllPlans('oopMaxIndividual');
+        if (isPair) {
+          assignSecondary('oopMaxFamily');
+        } else if (numPlans === 1 && amounts.length === 2 && !(/family/i.test(lbl))) {
+          planData[0].oopMaxIndividual = amounts[0];
+          planData[0].oopMaxFamily = amounts[1];
+        }
+      }
+    }
+    // PCP / Office visit copay
+    else if (/pcp|primary\s*care|office\s*visit|doctor\s*visit|physician/i.test(lbl)) {
+      assignAllPlans('copayPCP');
+    }
+    // Specialist copay
+    else if (/specialist/i.test(lbl)) {
+      assignAllPlans('copaySpecialist');
+    }
+    // ER copay
+    else if (/emergency/i.test(lbl)) {
+      assignAllPlans('copayER');
+    }
+    // Urgent care copay
+    else if (/urgent/i.test(lbl)) {
+      assignAllPlans('copayUrgentCare');
+    }
+    // Rx tiers
+    else if (/generic|tier\s*1/i.test(lbl)) {
+      assignAllPlans('rxTier1');
+    }
+    else if (/preferred\s*brand|tier\s*2/i.test(lbl)) {
+      assignAllPlans('rxTier2');
+    }
+    else if (/non[\s-]*preferred|tier\s*3|specialty/i.test(lbl)) {
+      assignAllPlans('rxTier3');
+    }
+    else if (/rx\s*deductible|pharmacy\s*deductible|drug\s*deductible/i.test(lbl)) {
+      assignAllPlans('rxDeductible');
+    }
+    // Premiums — by tier label in the row
+    else if (/premium|rate|monthly/i.test(lbl) || TIER_LABEL_RE.test(lbl)) {
+      if (/employee\s*only|emp\s*only|\bee\b|single/i.test(lbl)) {
+        assignAllPlans('premiumEE');
+      } else if (/emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp)|\bes\b/i.test(lbl)) {
+        assignAllPlans('premiumES');
+      } else if (/emp(?:loyee)?\s*[\+\/&]\s*(?:child|ch)|\bec\b/i.test(lbl)) {
+        assignAllPlans('premiumEC');
+      } else if (/family|emp(?:loyee)?\s*[\+\/&]\s*(?:fam)|\bef\b/i.test(lbl)) {
+        assignAllPlans('premiumEF');
+      }
+    }
+  }
+
+  // Calculate confidence and filter
+  const result = planData.filter(p => {
+    const kf = [p.carrier, p.planName, p.networkType, p.deductibleIndividual,
+                p.oopMaxIndividual, p.copayPCP, p.premiumEE, p.premiumES, p.premiumEC, p.premiumEF];
+    const found = kf.filter(v => v !== null && v !== undefined).length;
+    p.extractionConfidence = Math.min(1, found / 6);
+    return found >= 2;
+  });
+
+  return result;
+}
+
+// ── Post-extraction enrichment ────────────────────────────────────────────────
+// Scans the full text for labeled benefit values and fills any null fields on
+// all extracted plans.  If multiple plans exist but a benefit appears only once,
+// we assume it applies to all plans (common for same-carrier quotes).
+function enrichPlansFromText(plans, fullText) {
+  if (plans.length === 0) return;
+
+  // Build a set of {field, patterns} to try
+  const fieldPatterns = [
+    { field: 'deductibleIndividual', patterns: [
+      /(?:individual|in[\s-]?network)\s*deductible\s*[:\-]?\s*\$?([\d,]+)/i,
+      /deductible\s*(?:\([^)]*\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*(?:\/\s*\$?[\d,]+)?(?:\s*(?:individual|person|member|single))?/i,
+      /(?:in[\s-]?network|medical)\s*deductible\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+      /deductible[^$\n]{0,40}\$\s*([\d,]+)/i,
+    ]},
+    { field: 'deductibleFamily', patterns: [
+      /family\s*deductible\s*[:\-]?\s*\$?([\d,]+)/i,
+      /deductible[^$\n]*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+      /deductible\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+    ]},
+    { field: 'oopMaxIndividual', patterns: [
+      /(?:individual|in[\s-]?network)\s*(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-]?\s*\$?([\d,]+)/i,
+      /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*(?:\([^)]*\))?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+      /(?:max(?:imum)?\s*)?out[\s-]*of[\s-]*pocket\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+      /moop\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+      /oop[^$\n]{0,40}\$\s*([\d,]+)/i,
+    ]},
+    { field: 'oopMaxFamily', patterns: [
+      /family\s*(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-]?\s*\$?([\d,]+)/i,
+      /(?:out[\s-]*of[\s-]*pocket|oop)[^$\n]*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+      /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+    ]},
+    { field: 'copayPCP', patterns: [
+      /(?:pcp|primary\s*care|office\s*visit|doctor|physician)\s*(?:copay?|co[\s-]?pay(?:ment)?|visit)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+      /(?:pcp|office\s*visit|primary\s*care)\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    ]},
+    { field: 'copaySpecialist', patterns: [
+      /specialist\s*(?:copay?|co[\s-]?pay(?:ment)?|visit)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    ]},
+    { field: 'copayER', patterns: [
+      /(?:emergency\s*(?:room|dept|department|services?)|er\b)\s*(?:copay?|co[\s-]?pay(?:ment)?)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    ]},
+    { field: 'copayUrgentCare', patterns: [
+      /urgent\s*care\s*(?:copay?|co[\s-]?pay(?:ment)?)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    ]},
+    { field: 'coinsurance', patterns: [
+      /coinsurance\s*[:\-·.…]*\s*(\d+)\s*%/i,
+      /(\d+)\s*%\s*(?:co[\s-]?insurance|after\s+deductible)/i,
+    ]},
+  ];
+
+  for (const { field, patterns } of fieldPatterns) {
+    // Check if ALL plans are missing this field
+    const allMissing = plans.every(p => p[field] == null);
+    if (!allMissing) continue;
+
+    const raw = firstMatch(fullText, patterns);
+    if (raw == null) continue;
+    const val = field === 'coinsurance' ? raw : parseMoney(raw);
+    if (val == null) continue;
+
+    // Apply to all plans that are missing this field
+    for (const plan of plans) {
+      if (plan[field] == null) plan[field] = val;
+    }
+  }
+
+  // Recalculate confidence for each plan
+  for (const plan of plans) {
+    const kf = [plan.carrier, plan.planName, plan.networkType, plan.metalLevel,
+                plan.deductibleIndividual, plan.oopMaxIndividual, plan.copayPCP,
+                plan.premiumEE, plan.premiumES, plan.premiumEC, plan.premiumEF];
+    const found = kf.filter(v => v !== null && v !== undefined).length;
+    plan.extractionConfidence = Math.min(1, found / 6);
+  }
+}
+
+// ── De-duplicate plans ────────────────────────────────────────────────────────
+function deduplicatePlans(plans) {
+  // Normalize a plan name for dedup comparison
+  function normalizeName(name) {
+    return (name || '')
+      .toLowerCase()
+      .replace(/^(?:illustrative\s*)?quote\s*/i, '')
+      .replace(/[\r\n]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function recalcConfidence(plan) {
+    const kf = [plan.carrier, plan.planName, plan.networkType, plan.metalLevel,
+                plan.deductibleIndividual, plan.oopMaxIndividual, plan.copayPCP,
+                plan.premiumEE, plan.premiumES, plan.premiumEC, plan.premiumEF];
+    plan.extractionConfidence = Math.min(1, kf.filter(v => v != null).length / 6);
+  }
+
+  function mergePlanInto(existing, donor) {
+    for (const k of Object.keys(donor)) {
+      if (k === 'id' || k === 'extractionConfidence') continue;
+      if (existing[k] == null && donor[k] != null) existing[k] = donor[k];
+    }
+    recalcConfidence(existing);
+  }
+
+  const result = [];
+  for (const plan of plans) {
+    const normA = normalizeName(plan.planName);
+    // Try to find an existing plan to merge with
+    let merged = false;
+    for (const existing of result) {
+      const normB = normalizeName(existing.planName);
+      // Match if: same name, OR one is a substring of the other (handles truncated names)
+      const nameMatch = normA === normB ||
+        (normA.length > 10 && normB.length > 10 && (normA.includes(normB) || normB.includes(normA)));
+      // Carrier must match if both are set
+      const carrierMatch = !plan.carrier || !existing.carrier ||
+        String(plan.carrier).toLowerCase() === String(existing.carrier).toLowerCase();
+      if (nameMatch && carrierMatch) {
+        mergePlanInto(existing, plan);
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      result.push(plan);
+    }
+  }
+  return result;
+}
+
+// ── Detect carrier from text or filename ──────────────────────────────────────
+function detectCarrier(text, sourceFile) {
+  // Check filename first
+  const filePart = (sourceFile || '').replace(/[_\-\.]/g, ' ');
+  const fm = filePart.match(CARRIER_PATTERN);
+  if (fm) return normalizeCarrier(fm[1]);
+  // Check text
+  const tm = text.match(CARRIER_PATTERN);
+  if (tm) return normalizeCarrier(tm[1]);
+  return null;
+}
+
+function normalizeCarrier(raw) {
+  if (!raw) return null;
+  const up = raw.replace(/\s+/g, ' ').trim();
+  if (/bcbs|blue\s*cross/i.test(up)) return 'BCBS';
+  if (/united\s*health/i.test(up)) return 'UnitedHealthcare';
+  return up.charAt(0).toUpperCase() + up.slice(1);
+}
+
+// ── Table-based extraction (rate sheets) ──────────────────────────────────────
+// Real carrier PDFs often render as rows of data like:
+//   "Blue Choice PPO Gold   $40   $2,000  $6,000  $500.00  $1,200.00  $900.00  $1,800.00"
+// or columnar rate tables where premiums appear on rows labeled EE, ES, EC, EF
+function extractFromTable(lines, fullText, sourceFile) {
+  const plans = [];
+
+  // Strategy 1: Look for premium rate table rows
+  // e.g. "Employee Only   $500.00  $520.00  $480.00"
+  //       header row lists plan names across columns
+  const rateTablePlans = extractFromRateTable(lines, sourceFile);
+  if (rateTablePlans.length > 0) return rateTablePlans;
+
+  // Strategy 2: Look for rows that contain plan-like data with $ amounts
+  // e.g. "Blue Choice PPO 500   $40 copay   $2,000/$4,000   $6,000/$12,000   $500.00"
+  const rowPlans = extractFromDataRows(lines, fullText, sourceFile);
+  if (rowPlans.length > 0) return rowPlans;
+
+  return plans;
+}
+
+// Look for a rate table structure:
+// header row with plan names, followed by rows for EE/ES/EC/EF rates
+// Also looks for benefit rows (deductible, OOP, copay) with dollar amounts per plan column
+function extractFromRateTable(lines, sourceFile) {
+  const plans = [];
+  const tierLabels = {
+    ee: /\b(?:employee\s*only|ee\b|single\b|emp\s*only)/i,
+    es: /\b(?:emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp)|ee\s*[\+\/&]\s*sp|es\b|emp\s*(?:\+\s*)?spouse)/i,
+    ec: /\b(?:emp(?:loyee)?\s*[\+\/&]\s*(?:child(?:ren)?|ch)|ee\s*[\+\/&]\s*ch|ec\b|emp\s*(?:\+\s*)?child)/i,
+    ef: /\b(?:family|emp(?:loyee)?\s*[\+\/&]\s*(?:family|fam)|ee\s*[\+\/&]\s*fam|ef\b)/i,
+  };
+
+  // Benefit label patterns for benefit rows in rate tables
+  const benefitLabels = {
+    deductibleIndividual: /\bdeductible\b(?!.*family)/i,
+    deductibleFamily: /\bdeductible\b.*family/i,
+    oopMaxIndividual: /\b(?:out[\s-]*of[\s-]*pocket|oop|moop)\b(?!.*family)/i,
+    oopMaxFamily: /\b(?:out[\s-]*of[\s-]*pocket|oop|moop)\b.*family/i,
+    copayPCP: /\b(?:pcp|primary\s*care|office\s*visit|doctor\s*visit|physician)\b/i,
+    copaySpecialist: /\bspecialist\b/i,
+    copayER: /\b(?:emergency|er\b)/i,
+    copayUrgentCare: /\burgent\s*care\b/i,
+    rxTier1: /\b(?:generic|tier\s*1)\b/i,
+    rxTier2: /\b(?:preferred\s*brand|tier\s*2)\b/i,
+    rxTier3: /\b(?:non[\s-]*preferred|tier\s*3|specialty)\b/i,
+    coinsurance: /\bcoinsurance\b/i,
+  };
+
+  // Find rows with dollar amounts
+  const dollarRowRe = /\$[\d,]+(?:\.\d{2})?/g;
+
+  // Also track benefit-labeled rows for later assignment
+  const benefitRows = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const amounts = (line.match(dollarRowRe) || []).map(s => parseMoney(s));
+
+    // Check if this is a premium tier label row with dollar amounts
+    let matchedTier = null;
+    for (const [tier, re] of Object.entries(tierLabels)) {
+      if (re.test(line)) { matchedTier = tier; break; }
+    }
+
+    // Check if this is a benefit-labeled row
+    let matchedBenefit = null;
+    if (!matchedTier) {
+      for (const [field, re] of Object.entries(benefitLabels)) {
+        if (re.test(line) && amounts.length > 0) { matchedBenefit = field; break; }
+      }
+    }
+
+    if (!matchedTier && !matchedBenefit) continue;
+    if (amounts.length === 0) continue;
+
+    // Look backwards for a header row with plan names to create plan stubs
+    if (!plans.length) {
+      for (let j = Math.max(0, i - 15); j < i; j++) {
+        const hLine = lines[j];
+        const planNames = findPlanNamesInLine(hLine);
+        if (planNames.length >= amounts.length) {
+          for (let k = 0; k < amounts.length && k < planNames.length; k++) {
+            const pn = planNames[k];
+            plans.push({
+              id: uuidv4(),
+              carrier: null, planName: pn.name, planCode: null,
+              networkType: pn.network || null, metalLevel: pn.metal || null,
+              deductibleIndividual: null, deductibleFamily: null,
+              oopMaxIndividual: null, oopMaxFamily: null,
+              coinsurance: null, copayPCP: null, copaySpecialist: null,
+              copayUrgentCare: null, copayER: null,
+              rxDeductible: null, rxTier1: null, rxTier2: null, rxTier3: null,
+              premiumEE: null, premiumES: null, premiumEC: null, premiumEF: null,
+              effectiveDate: null, ratingArea: null, underwritingNotes: null,
+              extractionConfidence: 0, sourceFile,
+            });
+          }
+          break;
+        }
+      }
+      // If still no plan stubs and we have amounts, create generic plans
+      if (!plans.length && amounts.length > 0) {
+        for (let k = 0; k < amounts.length; k++) {
+          plans.push({
+            id: uuidv4(),
+            carrier: null, planName: `Plan ${k + 1}`, planCode: null,
+            networkType: null, metalLevel: null,
+            deductibleIndividual: null, deductibleFamily: null,
+            oopMaxIndividual: null, oopMaxFamily: null,
+            coinsurance: null, copayPCP: null, copaySpecialist: null,
+            copayUrgentCare: null, copayER: null,
+            rxDeductible: null, rxTier1: null, rxTier2: null, rxTier3: null,
+            premiumEE: null, premiumES: null, premiumEC: null, premiumEF: null,
+            effectiveDate: null, ratingArea: null, underwritingNotes: null,
+            extractionConfidence: 0, sourceFile,
+          });
+        }
+      }
+    }
+
+    // Assign premium amounts to the matching tier
+    if (matchedTier) {
+      const premKey = { ee: 'premiumEE', es: 'premiumES', ec: 'premiumEC', ef: 'premiumEF' }[matchedTier];
+      for (let k = 0; k < amounts.length && k < plans.length; k++) {
+        if (amounts[k] != null) plans[k][premKey] = amounts[k];
+      }
+    }
+
+    // Assign benefit amounts to the matching benefit field
+    if (matchedBenefit) {
+      for (let k = 0; k < amounts.length && k < plans.length; k++) {
+        if (amounts[k] != null && plans[k][matchedBenefit] == null) {
+          plans[k][matchedBenefit] = amounts[k];
+        }
+      }
+    }
+  }
+
+  // Fill in confidence and filter
+  const result = plans.filter(p => {
+    const kf = [p.carrier, p.planName, p.networkType, p.deductibleIndividual, p.oopMaxIndividual, p.copayPCP, p.premiumEE, p.premiumES, p.premiumEC, p.premiumEF];
+    const found = kf.filter(v => v !== null && v !== undefined).length;
+    p.extractionConfidence = Math.min(1, found / 6);
+    return found >= 2;
+  });
+  return result;
+}
+
+function findPlanNamesInLine(line) {
+  const plans = [];
+  const PLAN_KW = /\b(HMO|PPO|EPO|HDHP|HSA|Gold|Silver|Bronze|Platinum|Plus|Select|Choice|Value|Basic|Premier|Standard|Preferred|Essential|Core)\b/i;
+
+  // ── Approach 1: Split by tabs or 2+ spaces (common in pdf-parse table output)
+  const segments = line.split(/\t|\s{2,}/).map(s => s.trim()).filter(s => s.length > 3 && s.length < 80);
+  if (segments.length >= 2) {
+    const planSegs = segments.filter(s => PLAN_KW.test(s) && !/^\$|^\d+$/.test(s));
+    if (planSegs.length >= 2) {
+      for (const seg of planSegs) {
+        const network = (seg.match(/\b(HMO|PPO|EPO|HDHP|HSA)\b/i) || [])[1];
+        const metal = (seg.match(/\b(Gold|Silver|Bronze|Platinum)\b/i) || [])[1];
+        plans.push({ name: seg, network: network ? network.toUpperCase() : null, metal: metal ? metal.charAt(0).toUpperCase() + metal.slice(1).toLowerCase() : null });
+      }
+      return plans;
+    }
+  }
+
+  // ── Approach 2: Find all network/metal keyword positions and split around them
+  const kwPositions = [];
+  const kwRe = /\b(HMO|PPO|EPO|HDHP|HSA|Gold|Silver|Bronze|Platinum)\b/gi;
+  let km;
+  while ((km = kwRe.exec(line)) !== null) {
+    kwPositions.push({ keyword: km[1], index: km.index, end: km.index + km[0].length });
+  }
+  if (kwPositions.length >= 2) {
+    for (let i = 0; i < kwPositions.length; i++) {
+      const start = i === 0 ? 0 : kwPositions[i - 1].end;
+      let end = kwPositions[i].end;
+      // Include trailing digits/spaces (plan codes like "500", "1500")
+      const afterKw = line.substring(end);
+      const trailer = afterKw.match(/^[\s]*[\d]+/);
+      if (trailer) end += trailer[0].length;
+      const name = line.substring(start, end).trim();
+      if (name.length >= 4 && name.length < 80 && !/^\$/.test(name)) {
+        const network = (name.match(/\b(HMO|PPO|EPO|HDHP|HSA)\b/i) || [])[1];
+        const metal = (name.match(/\b(Gold|Silver|Bronze|Platinum)\b/i) || [])[1];
+        plans.push({ name, network: network ? network.toUpperCase() : null, metal: metal ? metal.charAt(0).toUpperCase() + metal.slice(1).toLowerCase() : null });
+      }
+    }
+    if (plans.length >= 2) return plans;
+    plans.length = 0;
+  }
+
+  // ── Approach 3: Single (non-greedy) match — fallback for a header with 1 plan name
+  const singleRe = /([A-Za-z][A-Za-z0-9\s\/\-&']{2,60}?(?:HMO|PPO|EPO|HDHP|HSA|Gold|Silver|Bronze|Platinum|Plus|Select|Choice|Value|Basic|Premier|Standard|Preferred|Essential|Core)(?:\s*\d{0,5})?)/gi;
+  let sm;
+  while ((sm = singleRe.exec(line)) !== null) {
+    const name = sm[1].trim();
+    if (name.length > 3 && name.length < 80) {
+      const network = (name.match(/\b(HMO|PPO|EPO|HDHP|HSA)\b/i) || [])[1];
+      const metal = (name.match(/\b(Gold|Silver|Bronze|Platinum)\b/i) || [])[1];
+      plans.push({ name, network: network ? network.toUpperCase() : null, metal: metal ? metal.charAt(0).toUpperCase() + metal.slice(1).toLowerCase() : null });
+    }
+  }
+  return plans;
+}
+
+// Look for data rows where a single line contains plan info + dollar amounts
+function extractFromDataRows(lines, fullText, sourceFile) {
+  const plans = [];
+  // Pattern: line with a plan-name-like string followed by multiple $ amounts
+  for (const line of lines) {
+    const dollarAmounts = [];
+    const dollarRe = /\$\s*([\d,]+(?:\.\d{1,2})?)/g;
+    let dm;
+    while ((dm = dollarRe.exec(line)) !== null) {
+      dollarAmounts.push(parseMoney(dm[1]));
+    }
+    if (dollarAmounts.length < 2) continue; // Need at least 2 numeric values
+
+    // Check if line contains a plan name
+    const planNameMatch = line.match(/([A-Za-z][A-Za-z0-9\s\/\-&']*(?:HMO|PPO|EPO|HDHP|HSA|Gold|Silver|Bronze|Platinum|Plus|Choice|Select|Value|Preferred|Essential|Core|Standard|Basic|Premier)[A-Za-z0-9\s\/\-&']*)/i);
+    if (!planNameMatch) continue;
+
+    const planName = planNameMatch[1].trim();
+    if (planName.length < 4) continue;
+
+    const network = (planName.match(/\b(HMO|PPO|EPO|HDHP|HSA)\b/i) || [])[1];
+    const metal = (planName.match(/\b(Gold|Silver|Bronze|Platinum)\b/i) || [])[1];
+
+    // Heuristic assignment of dollar amounts:
+    // Sort amounts to help guess which is premium vs deductible vs copay
+    // Premiums are typically $200-$3000/month, deductibles $250-$10000, copays $10-$100, OOP $2000-$16000
+    const sorted = [...dollarAmounts].filter(v => v != null);
+    let premiumEE = null, deductibleIndividual = null, oopMaxIndividual = null, copayPCP = null;
+    let premiumES = null, premiumEC = null, premiumEF = null;
+
+    // Try to identify based on typical ranges and position
+    const copays = sorted.filter(v => v >= 5 && v <= 100);
+    const deductibles = sorted.filter(v => v >= 100 && v <= 10000);
+    const oops = sorted.filter(v => v >= 2000 && v <= 20000);
+    const premiums = sorted.filter(v => v >= 100 && v <= 5000);
+
+    // If we have 4+ amounts that look like premiums (all in $100-$3000 range), treat as EE/ES/EC/EF
+    const premLike = sorted.filter(v => v >= 50 && v <= 4000);
+    if (premLike.length >= 3) {
+      // Likely a premium row: EE, ES, EC, EF (ascending)
+      const premSorted = [...premLike].sort((a, b) => a - b);
+      premiumEE = premSorted[0] || null;
+      premiumES = premSorted.length >= 2 ? premSorted[1] : null;
+      premiumEC = premSorted.length >= 3 ? premSorted[2] : null;
+      premiumEF = premSorted.length >= 4 ? premSorted[3] : null;
+    } else {
+      // Mixed types — try copay (smallest), premium, deductible, OOP (largest)
+      if (copays.length > 0) copayPCP = Math.min(...copays);
+      const remaining = sorted.filter(v => v !== copayPCP);
+      if (remaining.length >= 1) premiumEE = remaining.find(v => v >= 100 && v <= 3000) || null;
+      if (remaining.length >= 2) deductibleIndividual = remaining.find(v => v >= 500 && v <= 10000 && v !== premiumEE) || null;
+      if (remaining.length >= 3) oopMaxIndividual = remaining.find(v => v >= 2000 && v <= 20000 && v !== premiumEE && v !== deductibleIndividual) || null;
+    }
+
+    const keyFields = [planName, network, metal, deductibleIndividual, oopMaxIndividual, copayPCP, premiumEE];
+    const found = keyFields.filter(v => v !== null && v !== undefined).length;
+    if (found < 2) continue;
+
+    plans.push({
+      id: uuidv4(),
+      carrier: null, planName, planCode: null,
+      networkType: network ? network.toUpperCase() : null,
+      metalLevel: metal ? metal.charAt(0).toUpperCase() + metal.slice(1).toLowerCase() : null,
+      deductibleIndividual, deductibleFamily: null,
+      oopMaxIndividual, oopMaxFamily: null,
+      coinsurance: null, copayPCP,
+      copaySpecialist: null, copayUrgentCare: null, copayER: null,
+      rxDeductible: null, rxTier1: null, rxTier2: null, rxTier3: null,
+      premiumEE, premiumES, premiumEC, premiumEF,
+      effectiveDate: null, ratingArea: null, underwritingNotes: null,
+      extractionConfidence: Math.min(1, found / 6),
+      sourceFile,
+    });
+  }
+  return plans;
+}
+
 function splitIntoPlanBlocks(lines, fullText) {
-  // Look for lines that look like plan headers
-  const headerRe =
-    /^(?:plan\s*(name|type)?\s*[:\-]?\s*\d*\.?\s*)?([A-Z][A-Za-z0-9\s\/\-]*(HMO|PPO|EPO|HDHP|HSA|Platinum|Gold|Silver|Bronze)[A-Za-z0-9\s\/\-]*)\s*$/i;
+  // Look for lines that look like plan headers — broadened patterns
+  const headerPatterns = [
+    // Lines that are just a plan name like "Blue Choice PPO Gold 500"
+    /^[A-Z][A-Za-z0-9\s\/\-&']{3,60}\b(?:HMO|PPO|EPO|HDHP|HSA|Platinum|Gold|Silver|Bronze|Plus|Choice|Select|Value|Preferred|Essential|Core|Standard|Basic|Premier)\b[A-Za-z0-9\s\/\-&']{0,30}$/i,
+    // "Plan Name: ..." or "Plan 1:" etc.
+    /^(?:plan\s*(?:name|type|option|design)?\s*[:\-#]?\s*\d*\.?\s*)([A-Za-z].{3,60})$/i,
+    // "Option A:", "Option 1:" headers
+    /^(?:option|plan|benefit)\s*[A-Z1-9][:\-\s]/i,
+    // SBC-style "Summary of Benefits and Coverage" header
+    /^summary\s+of\s+benefits/i,
+    // "Schedule of Benefits" header
+    /^schedule\s+of\s+benefits/i,
+    // "Benefit Highlights" header
+    /^benefit\s+(?:highlights|summary|details)/i,
+    // Lines that start with a carrier name followed by plan identifier
+    /^(?:Anthem|Aetna|Cigna|United|Kaiser|BCBS|Blue\s*Cross|Humana|Oscar)[A-Za-z\s\/\-&']{4,60}(?:HMO|PPO|EPO|HDHP|HSA|Gold|Silver|Bronze|Platinum)/i,
+  ];
   const planStartIndices = [];
 
   lines.forEach((line, i) => {
-    if (headerRe.test(line) && line.length < 80) {
-      planStartIndices.push(i);
+    if (line.length > 120) return; // skip very long lines
+    for (const re of headerPatterns) {
+      if (re.test(line)) {
+        // Avoid marking consecutive header lines — require at least 5 lines gap
+        if (planStartIndices.length === 0 || i - planStartIndices[planStartIndices.length - 1] >= 5) {
+          planStartIndices.push(i);
+        }
+        break;
+      }
     }
   });
 
@@ -146,124 +1623,157 @@ function extractFieldsFromBlock(text, sourceFile) {
   const get = (patterns) => firstMatch(text, patterns);
 
   // Carrier
-  const carrier = get([
-    /(?:carrier|insurance\s*company|insurer)\s*[:\-]\s*([A-Za-z][A-Za-z\s&,.]+)/i,
-    /^(Anthem|Aetna|Cigna|United\s*Health|UHC|Kaiser|BlueCross|Blue\s*Cross|BCBS|Humana|Molina|Oscar|Centene|Wellmark|Harvard\s*Pilgrim|Tufts|HCSC|Premera|Regence|Providence|HealthNet|Health\s*Net|Coventry|WellCare|Magellan|Ambetter)/im,
-  ]);
+  const carrier = detectCarrier(text, sourceFile);
 
-  // Plan name
+  // Plan name — broadened
   const planName = get([
-    /(?:plan\s*name|plan\s*title)\s*[:\-]\s*([^\n]{3,60})/i,
-    /([A-Za-z][A-Za-z0-9\s\/\-]*(HMO|PPO|EPO|HDHP)[A-Za-z0-9\s\/\-]{0,30})/i,
+    /(?:plan\s*name|plan\s*title|plan\s*option|plan\s*design)\s*[:\-]\s*([^\n]{3,70})/i,
+    /([A-Za-z][A-Za-z0-9\s\/\-&']*(?:HMO|PPO|EPO|HDHP|HSA)[A-Za-z0-9\s\/\-&']{0,40})/i,
+    /([A-Za-z][A-Za-z0-9\s\/\-&']*(?:Gold|Silver|Bronze|Platinum)[A-Za-z0-9\s\/\-&']{0,40})/i,
+    /([A-Za-z][A-Za-z0-9\s\/\-&']*(?:Plus|Choice|Select|Value|Preferred|Essential|Core|Standard|Basic|Premier)[A-Za-z0-9\s\/\-&']{0,40})/i,
   ]);
 
   // Network type
-  const networkRaw = get([/\b(HDHP|EPO|HMO|PPO|HSA)\b/i]);
+  const networkRaw = get([/\b(HDHP|EPO|HMO|PPO|HSA|POS|OAP)\b/i]);
   const networkType = networkRaw ? networkRaw.toUpperCase() : null;
 
   // Metal level
-  const metalRaw = get([/\b(Platinum|Gold|Silver|Bronze)\b/i]);
+  const metalRaw = get([/\b(Platinum|Gold|Silver|Bronze|Catastrophic)\b/i]);
   const metalLevel = metalRaw ? metalRaw.charAt(0).toUpperCase() + metalRaw.slice(1).toLowerCase() : null;
 
-  // Deductible Individual
-  const dedIndRaw = get([
-    /individual\s+deductible\s*[:\-]?\s*\$?([\d,]+)/i,
-    /deductible\s*[:\-]?\s*individual\s*[:\-]?\s*\$?([\d,]+)/i,
-    /deductible\s*[:\-]?\s*\$?([\d,]+)/i,
-  ]);
-  const deductibleIndividual = parseMoney(dedIndRaw);
+  // ── Deductibles — expanded patterns ───────────────────────────────────────
+  // Handles: "Deductible: $1,500", "Deductible.....$1,500", "Individual Deductible $1,500",
+  //          "Deductible $1,500 / $3,000", "In-Network Deductible: $1,500",
+  //          "Medical Deductible $1,500", "$1,500 Deductible", etc.
+  const deductibleIndividual = parseMoney(get([
+    /individual\s+deductible\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /deductible\s*[:\-]?\s*individual\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /deductible\s*(?:\(individual\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*(?:individual|per\s*person|person|member|single)/i,
+    /deductible\s*(?:\(individual\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*[\/|]\s*\$?[\d,]+/i,
+    /(?:in[\s-]?network\s+)?(?:medical\s+)?deductible\s*(?:\((?:individual|in[\s-]?network)\))?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /\$\s*([\d,]+)\s*(?:individual\s+)?deductible/i,
+    /deductible[^$\n]{0,50}\$\s*([\d,]+)/i,
+    /ded(?:uctible)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+  ]));
 
-  // Deductible Family
-  const dedFamRaw = get([
-    /family\s+deductible\s*[:\-]?\s*\$?([\d,]+)/i,
-    /deductible\s*[:\-]?\s*family\s*[:\-]?\s*\$?([\d,]+)/i,
-  ]);
-  const deductibleFamily = parseMoney(dedFamRaw);
+  const deductibleFamily = parseMoney(get([
+    /family\s+deductible\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /deductible\s*[:\-]?\s*family\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    // "$X / $Y" pair — capture Y (family). Must have $ before both X and Y.
+    /deductible[^$\n]*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+    // Handle "(Individual/Family): $X / $Y"
+    /deductible\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+  ]));
 
-  // OOP Max Individual
-  const oopIndRaw = get([
-    /individual\s+out[\s-]of[\s-]pocket\s*(?:max(?:imum)?)?\s*[:\-]?\s*\$?([\d,]+)/i,
-    /out[\s-]of[\s-]pocket\s*(?:max(?:imum)?)?\s*[:\-]?\s*individual\s*[:\-]?\s*\$?([\d,]+)/i,
-    /oop\s*(?:max(?:imum)?)?\s*[:\-]?\s*\$?([\d,]+)/i,
-    /out[\s-]of[\s-]pocket\s*(?:max(?:imum)?)?\s*[:\-]?\s*\$?([\d,]+)/i,
-  ]);
-  const oopMaxIndividual = parseMoney(oopIndRaw);
+  // ── Out-of-Pocket Max — expanded patterns ────────────────────────────────
+  // Handles: "OOP Max: $6,000", "Out-of-Pocket Maximum.....$6,000",
+  //          "Maximum Out of Pocket $6,000 / $12,000", "MOOP: $6,000",
+  //          "Individual OOP Max $6,000", "$6,000 Out of Pocket Maximum"
+  const oopMaxIndividual = parseMoney(get([
+    /individual\s+(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-]?\s*(?:individual|in[\s-]?network)\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*(?:\(individual\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*(?:individual|per\s*person|person|member|single)/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*(?:\(individual\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*[\/|]\s*\$?[\d,]+/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*(?:\([^)]*\))?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /(?:max(?:imum)?\s*)?out[\s-]*of[\s-]*pocket\s*(?:max(?:imum)?)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /\$\s*([\d,]+)\s*(?:individual\s+)?(?:out[\s-]*of[\s-]*pocket|oop)/i,
+    /moop\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /oop[^$\n]{0,50}\$\s*([\d,]+)/i,
+  ]));
 
-  // OOP Max Family
-  const oopFamRaw = get([
-    /family\s+out[\s-]of[\s-]pocket\s*(?:max(?:imum)?)?\s*[:\-]?\s*\$?([\d,]+)/i,
-    /out[\s-]of[\s-]pocket\s*(?:max(?:imum)?)?\s*family\s*[:\-]?\s*\$?([\d,]+)/i,
-  ]);
-  const oopMaxFamily = parseMoney(oopFamRaw);
+  const oopMaxFamily = parseMoney(get([
+    /family\s+(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    // "$X / $Y" pair — capture Y (family). Must have $ before both X and Y.
+    /(?:out[\s-]*of[\s-]*pocket|oop)[^$\n]*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+    // Handle "(Individual/Family): $X / $Y"
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+  ]));
 
   // Coinsurance
-  const coinsurance = get([/coinsurance\s*[:\-]?\s*(\d+%(?:\s*\/\s*\d+%)?)/i]);
-
-  // Copays
-  const copayPCPRaw = get([
-    /pcp\s*copay?\s*[:\-]?\s*\$?([\d]+)/i,
-    /primary\s*care\s*(?:physician|visit)?\s*(?:copay?)?\s*[:\-]?\s*\$?([\d]+)/i,
-    /office\s*visit\s*(?:copay?)?\s*[:\-]?\s*\$?([\d]+)/i,
+  const coinsurance = get([
+    /coinsurance\s*[:\-·.…]*\s*(\d+%(?:\s*[\/\-]\s*\d+%)?)/i,
+    /(\d+%)\s*(?:co[\s-]?insurance|after\s+deductible)/i,
+    /(?:you\s+pay|member\s+pays?|plan\s+pays?)\s*[:\-]?\s*(\d+%)/i,
   ]);
-  const copayPCP = parseMoney(copayPCPRaw);
 
-  const copaySpecRaw = get([
-    /specialist\s*(?:copay?)?\s*[:\-]?\s*\$?([\d]+)/i,
-    /specialist\s*visit\s*(?:copay?)?\s*[:\-]?\s*\$?([\d]+)/i,
-  ]);
-  const copaySpecialist = parseMoney(copaySpecRaw);
+  // ── Copays — expanded patterns ──────────────────────────────────────────
+  // Handles: "PCP Copay: $25", "Office Visit.....$25", "Primary Care $25 copay",
+  //          "$25 PCP", "Doctor Visit Copay $25"
+  const copayPCP = parseMoney(get([
+    /(?:pcp|primary\s*care(?:\s*physician)?|office\s*visit|doctor\s*visit|physician\s*visit)\s*(?:copay?|co[\s-]?pay(?:ment)?)\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    /(?:copay?|co[\s-]?pay)\s*[:\-]?\s*\$?([\d]+)\s*(?:pcp|primary\s*care|office\s*visit)/i,
+    /(?:pcp|office\s*visit|primary\s*care)\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    /\$\s*([\d]+)\s*(?:pcp|office\s*visit|primary\s*care)/i,
+    /(?:pcp|primary\s*care|office\s*visit)[^$\n]{0,30}\$\s*([\d]+)/i,
+  ]));
 
-  const copayUCRaw = get([
-    /urgent\s*care\s*(?:copay?)?\s*[:\-]?\s*\$?([\d]+)/i,
-    /urgent\s*(?:care)?\s*[:\-]?\s*\$?([\d]+)/i,
-  ]);
-  const copayUrgentCare = parseMoney(copayUCRaw);
+  const copaySpecialist = parseMoney(get([
+    /specialist\s*(?:copay?|co[\s-]?pay(?:ment)?|visit)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    /(?:copay?|co[\s-]?pay)\s*[:\-]?\s*\$?([\d]+)\s*(?:specialist)/i,
+    /specialist[^$\n]{0,30}\$\s*([\d]+)/i,
+  ]));
 
-  const copayERRaw = get([
-    /emergency\s*(?:room|dept|department)?\s*(?:copay?)?\s*[:\-]?\s*\$?([\d]+)/i,
-    /er\s*(?:copay?)?\s*[:\-]?\s*\$?([\d]+)/i,
-  ]);
-  const copayER = parseMoney(copayERRaw);
+  const copayUrgentCare = parseMoney(get([
+    /urgent\s*care\s*(?:copay?|co[\s-]?pay(?:ment)?)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    /urgent\s*care[^$\n]{0,30}\$\s*([\d]+)/i,
+  ]));
 
-  // Rx
-  const rxDedRaw = get([/rx\s*deductible\s*[:\-]?\s*\$?([\d,]+)/i]);
-  const rxDeductible = parseMoney(rxDedRaw);
+  const copayER = parseMoney(get([
+    /(?:emergency\s*(?:room|dept|department|services?)|er)\s*(?:copay?|co[\s-]?pay(?:ment)?)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    /(?:copay?|co[\s-]?pay)\s*[:\-]?\s*\$?([\d]+)\s*(?:emergency|er\b)/i,
+    /emergency[^$\n]{0,30}\$\s*([\d]+)/i,
+  ]));
 
-  const rxT1Raw = get([/(?:generic|tier\s*1|tier1)\s*(?:rx|drug|copay?)?\s*[:\-]?\s*\$?([\d]+)/i]);
-  const rxTier1 = parseMoney(rxT1Raw);
+  // ── Rx / Pharmacy ──────────────────────────────────────────────────────
+  const rxDeductible = parseMoney(get([
+    /(?:rx|pharmacy|drug|prescription)\s*deductible\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+  ]));
+  const rxTier1 = parseMoney(get([
+    /(?:generic|tier\s*(?:1|i)\b|tier1)\s*(?:rx|drug|copay?|co[\s-]?pay)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    /(?:generic|tier\s*1)[^$\n]{0,30}\$\s*([\d]+)/i,
+  ]));
+  const rxTier2 = parseMoney(get([
+    /(?:preferred\s*brand|tier\s*(?:2|ii)\b|tier2)\s*(?:rx|drug|copay?|co[\s-]?pay)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    /(?:preferred\s*brand|tier\s*2)[^$\n]{0,30}\$\s*([\d]+)/i,
+  ]));
+  const rxTier3 = parseMoney(get([
+    /(?:non[\s-]?preferred\s*brand|tier\s*(?:3|iii)\b|tier3|specialty)\s*(?:rx|drug|copay?|co[\s-]?pay)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+    /(?:non[\s-]?preferred|tier\s*3|specialty)[^$\n]{0,30}\$\s*([\d]+)/i,
+  ]));
 
-  const rxT2Raw = get([/(?:preferred\s*brand|tier\s*2|tier2)\s*(?:rx|drug|copay?)?\s*[:\-]?\s*\$?([\d]+)/i]);
-  const rxTier2 = parseMoney(rxT2Raw);
+  // ── Premiums — expanded patterns ───────────────────────────────────────
+  // Handles: "Employee Only: $500.00", "EE.....$500.00", "EE Premium $500.00",
+  //          "Single Rate: $500.00", "Employee Only $500.00"
+  const premiumEE = parseMoney(get([
+    /(?:employee\s*only|ee\b|emp\s*only|single)\s*(?:monthly\s*)?(?:premium|rate|cost)?\s*[:\-·.…]*\s*\$?([\d,]+\.?\d*)/i,
+    /(?:premium|rate|cost)\s*[:\-]?\s*(?:employee\s*only|ee)\s*[:\-·.…]*\s*\$?([\d,]+\.?\d*)/i,
+    /(?:employee\s*only|ee|single)\s+\$?([\d,]+\.\d{2})/i,
+    /(?:employee\s*only|ee|single)[^$\n]{0,30}\$\s*([\d,]+\.\d{2})/i,
+  ]));
 
-  const rxT3Raw = get([/(?:non[\s-]preferred\s*brand|tier\s*3|tier3)\s*(?:rx|drug|copay?)?\s*[:\-]?\s*\$?([\d]+)/i]);
-  const rxTier3 = parseMoney(rxT3Raw);
+  const premiumES = parseMoney(get([
+    /(?:emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp)|emp\s*spouse|ee\s*[\+\/&]\s*sp|es\b|employee\s*[\+\/&\s]\s*spouse|emp(?:loyee)?\/spouse)\s*(?:monthly\s*)?(?:premium|rate|cost)?\s*[:\-·.…]*\s*\$?([\d,]+\.?\d*)/i,
+    /(?:employee\s*[\+\/&]\s*spouse|emp\+sp|ee\+sp|es)\s+\$?([\d,]+\.\d{2})/i,
+    /(?:emp(?:loyee)?\s*[\+\/&]\s*spouse|es)[^$\n]{0,30}\$\s*([\d,]+\.\d{2})/i,
+  ]));
 
-  // Premiums
-  const premEERaw = get([
-    /(?:ee|employee\s*only|employee)\s*(?:monthly)?\s*(?:premium|rate)?\s*[:\-]?\s*\$?([\d,]+\.?\d*)/i,
-    /premium\s*(?:ee|employee\s*only)\s*[:\-]?\s*\$?([\d,]+\.?\d*)/i,
-  ]);
-  const premiumEE = parseMoney(premEERaw);
+  const premiumEC = parseMoney(get([
+    /(?:emp(?:loyee)?\s*[\+\/&]\s*(?:child(?:ren)?|ch|dep)|ee\s*[\+\/&]\s*ch|ec\b|employee\s*[\+\/&\s]\s*child(?:ren)?|emp(?:loyee)?\/child(?:ren)?)\s*(?:monthly\s*)?(?:premium|rate|cost)?\s*[:\-·.…]*\s*\$?([\d,]+\.?\d*)/i,
+    /(?:employee\s*[\+\/&]\s*child(?:ren)?|emp\+ch|ee\+ch|ec)\s+\$?([\d,]+\.\d{2})/i,
+    /(?:emp(?:loyee)?\s*[\+\/&]\s*child|ec)[^$\n]{0,30}\$\s*([\d,]+\.\d{2})/i,
+  ]));
 
-  const premESRaw = get([
-    /(?:es|emp\+sp|employee\s*\+?\s*spouse|employee\/spouse)\s*(?:monthly)?\s*(?:premium|rate)?\s*[:\-]?\s*\$?([\d,]+\.?\d*)/i,
-  ]);
-  const premiumES = parseMoney(premESRaw);
-
-  const premECRaw = get([
-    /(?:ec|emp\+ch|employee\s*\+?\s*child(?:ren)?|employee\/child(?:ren)?)\s*(?:monthly)?\s*(?:premium|rate)?\s*[:\-]?\s*\$?([\d,]+\.?\d*)/i,
-  ]);
-  const premiumEC = parseMoney(premECRaw);
-
-  const premEFRaw = get([
-    /(?:ef|family|employee\s*\+?\s*family|employee\/family)\s*(?:monthly)?\s*(?:premium|rate)?\s*[:\-]?\s*\$?([\d,]+\.?\d*)/i,
-  ]);
-  const premiumEF = parseMoney(premEFRaw);
+  const premiumEF = parseMoney(get([
+    /(?:family|emp(?:loyee)?\s*[\+\/&]\s*(?:family|fam)|ee\s*[\+\/&]\s*fam|ef\b|employee\s*[\+\/&\s]\s*family|emp(?:loyee)?\/family)\s*(?:monthly\s*)?(?:premium|rate|cost)?\s*[:\-·.…]*\s*\$?([\d,]+\.?\d*)/i,
+    /(?:employee\s*[\+\/&]\s*family|family|emp\+fam|ee\+fam|ef)\s+\$?([\d,]+\.\d{2})/i,
+    /(?:family|ef)[^$\n]{0,30}\$\s*([\d,]+\.\d{2})/i,
+  ]));
 
   // Effective date
   const effectiveDate = get([
     /effective\s*(?:date)?\s*[:\-]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
     /effective\s*[:\-]?\s*(\w+ \d{1,2},?\s*\d{4})/i,
+    /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})\s*(?:effective|start|begin)/i,
   ]);
 
   // Plan code
@@ -278,7 +1788,7 @@ function extractFieldsFromBlock(text, sourceFile) {
   // Confidence: how many key fields were found
   const keyFields = [
     carrier, planName, networkType, metalLevel, deductibleIndividual,
-    oopMaxIndividual, copayPCP, premiumEE,
+    oopMaxIndividual, copayPCP, premiumEE, premiumES, premiumEC, premiumEF,
   ];
   const found = keyFields.filter(v => v !== null && v !== undefined).length;
   const extractionConfidence = Math.min(1, found / 6);
@@ -294,22 +1804,22 @@ function extractFieldsFromBlock(text, sourceFile) {
     networkType: networkType || null,
     metalLevel: metalLevel || null,
     deductibleIndividual,
-    deductibleFamily,
+    deductibleFamily: deductibleFamily || null,
     oopMaxIndividual,
-    oopMaxFamily,
+    oopMaxFamily: oopMaxFamily || null,
     coinsurance: coinsurance || null,
     copayPCP,
-    copaySpecialist,
-    copayUrgentCare,
-    copayER,
-    rxDeductible,
-    rxTier1,
-    rxTier2,
-    rxTier3,
+    copaySpecialist: copaySpecialist || null,
+    copayUrgentCare: copayUrgentCare || null,
+    copayER: copayER || null,
+    rxDeductible: rxDeductible || null,
+    rxTier1: rxTier1 || null,
+    rxTier2: rxTier2 || null,
+    rxTier3: rxTier3 || null,
     premiumEE,
-    premiumES,
-    premiumEC,
-    premiumEF,
+    premiumES: premiumES || null,
+    premiumEC: premiumEC || null,
+    premiumEF: premiumEF || null,
     effectiveDate: effectiveDate || null,
     ratingArea: ratingArea || null,
     underwritingNotes: underwritingNotes || null,
@@ -480,7 +1990,7 @@ function buildPlansFromKeyValueSheet(aoa, sourceFile) {
 }
 
 // ── Parse endpoint ────────────────────────────────────────────────────────────
-app.post('/parse', authMiddleware, async (req, res) => {
+app.post('/parse', async (req, res) => {
   try {
     const { caseId } = req.body;
     if (!caseId) return res.status(400).json({ error: 'caseId is required' });
@@ -495,7 +2005,10 @@ app.post('/parse', authMiddleware, async (req, res) => {
       try {
         if (ext === 'pdf') {
           const data = await pdfParse(file.buffer);
+          console.log(`[PARSE] PDF "${file.originalname}" — extracted ${data.text.length} chars, ${data.text.split('\n').length} lines`);
+          console.log(`[PARSE] First 2000 chars:\n${data.text.substring(0, 2000)}`);
           const plans = extractPlanFromText(data.text, file.originalname);
+          console.log(`[PARSE] Extracted ${plans.length} plans from "${file.originalname}":`, plans.map(p => ({ name: p.planName, ded: p.deductibleIndividual, oop: p.oopMaxIndividual, pcp: p.copayPCP, eeP: p.premiumEE })));
           if (plans.length === 0) {
             warnings.push(`No plans extracted from ${file.originalname} — check file formatting`);
           }
@@ -517,74 +2030,125 @@ app.post('/parse', authMiddleware, async (req, res) => {
     caseData.plans = allPlans;
     caseStore.set(caseId, caseData);
 
-    res.json({ caseId, plans: allPlans, census: caseData.census || {}, warnings });
+    // Include a raw text preview for debugging extraction issues
+    const rawTextPreviews = [];
+    for (const file of caseData.files) {
+      const ext = file.originalname.split('.').pop().toLowerCase();
+      if (ext === 'pdf') {
+        try {
+          const data = await pdfParse(file.buffer);
+          rawTextPreviews.push({ file: file.originalname, preview: data.text.substring(0, 5000), totalLength: data.text.length });
+        } catch (e) { /* skip */ }
+      }
+    }
+
+    res.json({ caseId, plans: allPlans, census: caseData.census || {}, warnings, rawTextPreviews });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ── Recommend endpoint ────────────────────────────────────────────────────────
-function scorePlans(plans, census) {
+function scorePlans(plans, census, contribution) {
   const { ee = 0, es = 0, ec = 0, ef = 0 } = census;
-  const totalHeads = ee + es + ec + ef;
+  const totalEnrolled = ee + es + ec + ef;
 
   const scored = plans.map(plan => {
-    // ── Premium Efficiency (40%) ──
+    // ── Premium Cost (weighted by enrollment) ──
     let monthlyTotal = 0;
     if (plan.premiumEE) monthlyTotal += plan.premiumEE * ee;
     if (plan.premiumES) monthlyTotal += plan.premiumES * es;
     if (plan.premiumEC) monthlyTotal += plan.premiumEC * ec;
     if (plan.premiumEF) monthlyTotal += plan.premiumEF * ef;
 
-    // ── Risk Protection (30%) ──
-    const ded = plan.deductibleIndividual || 0;
-    const oop = plan.oopMaxIndividual || 0;
-    // $0 deductible+OOP = 100, $15000 = 0
-    const riskRaw = Math.max(0, 1 - (ded + oop) / 15000);
+    // ── Risk Protection ──
+    // When benefits are null (unknown), use neutral score (0.5), NOT perfect (1.0)
+    const dedKnown = plan.deductibleIndividual != null;
+    const oopKnown = plan.oopMaxIndividual != null;
+    let riskScore = 0.5; // neutral default for unknown
+    if (dedKnown || oopKnown) {
+      const ded = plan.deductibleIndividual || 0;
+      const oop = plan.oopMaxIndividual || 0;
+      // $0 combined = 1.0, $15,000+ combined = 0
+      riskScore = Math.max(0, 1 - (ded + oop) / 15000);
+    }
 
-    // ── Copay Usability (20%) ──
-    const pcp = plan.copayPCP || 50; // default 50 if unknown
-    const copayScore = Math.max(0, 1 - pcp / 100);
-    // bonus: if copayPCP exists and deductible is 0 or copay-first model
-    const copayFirst = plan.copayPCP !== null && (plan.deductibleIndividual === 0 || plan.deductibleIndividual === null);
-    const copayUsability = copayFirst ? Math.min(1, copayScore + 0.2) : copayScore;
+    // ── Copay Usability ──
+    let copayUsability = 0.5; // neutral default for unknown
+    if (plan.copayPCP != null) {
+      const copayScore = Math.max(0, 1 - plan.copayPCP / 100);
+      // Bonus for copay-first plans (no deductible before copay kicks in)
+      const copayFirst = plan.deductibleIndividual === 0 || (plan.copayPCP > 0 && plan.deductibleIndividual == null);
+      copayUsability = copayFirst ? Math.min(1, copayScore + 0.15) : copayScore;
+    }
 
-    // ── Network (10%) ──
-    const networkScores = { PPO: 1.0, EPO: 0.8, HMO: 0.7, HDHP: 0.5, HSA: 0.5 };
-    const networkScore = networkScores[(plan.networkType || '').toUpperCase()] || 0.65;
+    // ── Network Preference ──
+    // PPO plans get a significant boost: broader networks, out-of-network coverage,
+    // no referral requirements — clients strongly prefer these
+    const networkScores = { PPO: 1.0, EPO: 0.7, POS: 0.7, HMO: 0.5, HDHP: 0.4, HSA: 0.4 };
+    const networkScore = networkScores[(plan.networkType || '').toUpperCase()] || 0.5;
+
+    // ── Metal Level Value ──
+    // Higher metal levels = richer benefits, better day-to-day coverage
+    const metalScores = { Platinum: 1.0, Gold: 0.85, Silver: 0.6, Bronze: 0.3, Catastrophic: 0.1 };
+    const metalScore = metalScores[plan.metalLevel] || 0.5;
+
+    const contributionSummary = calculatePlanCostShares(plan, census, contribution);
 
     return {
       ...plan,
       _monthlyTotal: monthlyTotal,
-      _riskRaw: riskRaw,
+      _riskScore: riskScore,
       _copayUsability: copayUsability,
       _networkScore: networkScore,
+      _metalScore: metalScore,
+      _contributionSummary: contributionSummary,
     };
   });
 
-  // Normalize premium efficiency across plans
+  // Normalize premium efficiency across plans (relative ranking)
   const premiums = scored.map(p => p._monthlyTotal).filter(v => v > 0);
   const maxPremium = premiums.length > 0 ? Math.max(...premiums) : 1;
   const minPremium = premiums.length > 0 ? Math.min(...premiums) : 0;
   const premRange = maxPremium - minPremium || 1;
+
+  // Check if benefit data is available across plans
+  const hasBenefitData = scored.some(p => p.deductibleIndividual != null || p.oopMaxIndividual != null);
 
   const result = scored.map(plan => {
     const premEfficiency = plan._monthlyTotal > 0
       ? Math.max(0, 1 - (plan._monthlyTotal - minPremium) / premRange)
       : 0.5; // unknown premium gets middle score
 
-    const totalScore =
-      premEfficiency * 0.40 +
-      plan._riskRaw * 0.30 +
-      plan._copayUsability * 0.20 +
-      plan._networkScore * 0.10;
+    // Adaptive weighting: when benefits are unknown, rely more on premium + network + metal
+    // When benefits are known, use a more balanced scoring
+    let totalScore;
+    if (hasBenefitData) {
+      // Full scoring with benefit data available
+      totalScore =
+        premEfficiency     * 0.30 +   // Premium cost (reduced from 40%)
+        plan._riskScore    * 0.20 +   // Deductible + OOP protection
+        plan._copayUsability * 0.15 + // Copay accessibility
+        plan._networkScore * 0.20 +   // Network breadth (PPO boost)
+        plan._metalScore   * 0.15;    // Metal level richness
+    } else {
+      // Rate-only scoring: no benefit data, weight network/metal more heavily
+      totalScore =
+        premEfficiency     * 0.30 +   // Premium cost
+        plan._networkScore * 0.30 +   // Network breadth (PPO gets big boost)
+        plan._metalScore   * 0.30 +   // Metal level as proxy for benefit richness
+        plan._copayUsability * 0.05 + // Copay (likely unknown)
+        plan._riskScore    * 0.05;    // Risk (likely unknown)
+    }
 
     const reasons = [];
     if (premEfficiency >= 0.7) reasons.push('competitive premium costs');
-    if (plan._riskRaw >= 0.7) reasons.push('strong risk protection (low deductible + OOP max)');
-    if (plan._copayUsability >= 0.7) reasons.push('excellent copay accessibility');
-    if (plan._networkScore >= 0.9) reasons.push('broad PPO network flexibility');
-    if (plan.metalLevel === 'Gold' || plan.metalLevel === 'Platinum') reasons.push('rich benefit structure');
+    if (plan._riskScore >= 0.7 && (plan.deductibleIndividual != null)) reasons.push('strong risk protection (low deductible + OOP max)');
+    if (plan._copayUsability >= 0.7 && plan.copayPCP != null) reasons.push('excellent copay accessibility');
+    if (plan._networkScore >= 0.9) reasons.push('broad PPO network — no referrals required, out-of-network coverage');
+    if (plan._metalScore >= 0.8) reasons.push('rich benefit design (' + (plan.metalLevel || 'high tier') + ')');
+    if (plan._networkScore >= 0.7 && plan._networkScore < 0.9) reasons.push('good network flexibility');
+    if (premEfficiency >= 0.4 && premEfficiency < 0.7 && plan._networkScore >= 0.9) reasons.push('premium value for PPO-level access');
     if (reasons.length === 0) reasons.push('balanced overall value');
 
     const whyRecommended = `This plan scores well due to ${reasons.slice(0, 3).join(', ')}.`;
@@ -592,11 +2156,18 @@ function scorePlans(plans, census) {
     return {
       ...plan,
       premiumEfficiencyScore: Math.round(premEfficiency * 100) / 100,
-      riskProtectionScore: Math.round(plan._riskRaw * 100) / 100,
+      riskProtectionScore: Math.round(plan._riskScore * 100) / 100,
       copayUsabilityScore: Math.round(plan._copayUsability * 100) / 100,
       networkScore: Math.round(plan._networkScore * 100) / 100,
+      metalScore: Math.round(plan._metalScore * 100) / 100,
       totalScore: Math.round(totalScore * 1000) / 1000,
       monthlyTotalCost: Math.round(plan._monthlyTotal * 100) / 100,
+      employerMonthlyCost: Math.round(plan._contributionSummary.employerMonthlyTotal * 100) / 100,
+      employeeMonthlyCost: Math.round(plan._contributionSummary.employeeMonthlyTotal * 100) / 100,
+      employerPerPayCost: Math.round(plan._contributionSummary.employerPerPayTotal * 100) / 100,
+      employeePerPayCost: Math.round(plan._contributionSummary.employeePerPayTotal * 100) / 100,
+      payrollFrequency: plan._contributionSummary.payrollFrequency,
+      contributionBreakdown: plan._contributionSummary.byTier,
       whyRecommended,
     };
   });
@@ -604,40 +2175,93 @@ function scorePlans(plans, census) {
   return result.sort((a, b) => b.totalScore - a.totalScore);
 }
 
-app.post('/recommend', authMiddleware, (req, res) => {
+app.post('/recommend', (req, res) => {
   try {
-    const { caseId, census } = req.body;
+    const { caseId, census, contribution } = req.body;
     if (!caseId) return res.status(400).json({ error: 'caseId is required' });
     const caseData = caseStore.get(caseId);
     if (!caseData) return res.status(404).json({ error: 'Case not found' });
 
     if (census) caseData.census = census;
+    if (contribution) caseData.contribution = normalizeContributionConfig(contribution);
+    if (!caseData.contribution) caseData.contribution = defaultContributionConfig();
     const plans = caseData.plans || [];
     if (plans.length === 0) return res.status(400).json({ error: 'No plans to score — run /parse first' });
 
-    const allScored = scorePlans(plans, caseData.census || {});
-    const recommendations = allScored.slice(0, 3).map((p, i) => ({ rank: i + 1, ...p }));
+    const allScored = scorePlans(plans, caseData.census || {}, caseData.contribution);
 
-    caseData.recommendations = { recommendations, allPlans: allScored };
+    // Pick top 3, but always ensure the lowest-cost plan is included
+    let top = allScored.slice(0, 3);
+
+    // Find lowest-cost plan (by EE premium as baseline when no census, else weighted total)
+    const plansWithPremium = allScored.filter(p => p.monthlyTotalCost > 0 || (p.premiumEE != null && p.premiumEE > 0));
+    let lowestCost = null;
+    if (plansWithPremium.length > 0) {
+      lowestCost = plansWithPremium.reduce((best, p) => {
+        const costA = best.monthlyTotalCost > 0 ? best.monthlyTotalCost : (best.premiumEE || Infinity);
+        const costB = p.monthlyTotalCost > 0 ? p.monthlyTotalCost : (p.premiumEE || Infinity);
+        return costB < costA ? p : best;
+      });
+    }
+
+    // Tag which plans are already in top 3
+    const topIds = new Set(top.map(p => p.planName + '|' + p.carrier));
+    const lowestCostId = lowestCost ? (lowestCost.planName + '|' + lowestCost.carrier) : null;
+
+    if (lowestCost && !topIds.has(lowestCostId)) {
+      // Replace #3 with lowest cost; it becomes the 3rd tile
+      top = top.slice(0, 2);
+      top.push(lowestCost);
+    }
+
+    // Assign ranks and labels
+    const recommendations = top.map((p, i) => {
+      const isLowest = lowestCost && (p.planName + '|' + p.carrier) === lowestCostId;
+      return {
+        rank: i + 1,
+        ...p,
+        recommendationLabel: isLowest ? 'Lowest Cost Option' : (i === 0 ? 'Top Pick' : i === 1 ? 'Runner-Up' : 'Strong Alternative'),
+      };
+    });
+
+    caseData.recommendations = {
+      recommendations,
+      allPlans: allScored,
+      contribution: caseData.contribution,
+    };
     caseStore.set(caseId, caseData);
 
-    res.json({ caseId, recommendations, allPlans: allScored });
+    res.json({ caseId, recommendations, allPlans: allScored, contribution: caseData.contribution });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // ── Export PPTX ───────────────────────────────────────────────────────────────
-app.post('/export/pptx', authMiddleware, async (req, res) => {
+app.post('/export/pptx', async (req, res) => {
   try {
-    const { caseId, clientName = 'Client', effectiveDate = '' } = req.body;
+    const { caseId, clientName = 'Client', effectiveDate = '', contribution } = req.body;
     if (!caseId) return res.status(400).json({ error: 'caseId is required' });
     const caseData = caseStore.get(caseId);
     if (!caseData) return res.status(404).json({ error: 'Case not found' });
 
     const plans = caseData.plans || [];
     const recData = caseData.recommendations || {};
-    const recommendations = recData.recommendations || plans.slice(0, 3).map((p, i) => ({ rank: i + 1, ...p }));
+    const contributionConfig = normalizeContributionConfig(contribution || recData.contribution || caseData.contribution || defaultContributionConfig());
+    caseData.contribution = contributionConfig;
+    const recommendations = (recData.recommendations || plans.slice(0, 3).map((p, i) => ({ rank: i + 1, ...p }))).map(plan => {
+      if (typeof plan.employerPerPayCost === 'number' && typeof plan.employeePerPayCost === 'number') return plan;
+      const shares = calculatePlanCostShares(plan, caseData.census || {}, contributionConfig);
+      return {
+        ...plan,
+        employerMonthlyCost: Math.round(shares.employerMonthlyTotal * 100) / 100,
+        employeeMonthlyCost: Math.round(shares.employeeMonthlyTotal * 100) / 100,
+        employerPerPayCost: Math.round(shares.employerPerPayTotal * 100) / 100,
+        employeePerPayCost: Math.round(shares.employeePerPayTotal * 100) / 100,
+        payrollFrequency: shares.payrollFrequency,
+        contributionBreakdown: shares.byTier,
+      };
+    });
     const census = caseData.census || {};
 
     const pptx = new PptxGenJS();
@@ -649,44 +2273,79 @@ app.post('/export/pptx', authMiddleware, async (req, res) => {
     const WHITE = 'FFFFFF';
     const LIGHT = 'f4f6f9';
     const TEXT_DARK = '2c3e50';
+    const GOLD = 'd4af37';
+    const SILVER = '9e9e9e';
+    const BRONZE = 'cd7f32';
+    const GREEN = '27ae60';
+    const MUTED = '7f8c8d';
+    const ORANGE = 'e67e22';
 
-    const addSlideHeader = (slide, title) => {
+    const fmtDol = v => v != null ? `$${Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : '—';
+    const fmtInt = v => v != null ? `$${Number(v).toLocaleString()}` : '—';
+
+    const addSlideHeader = (slide, title, subtitle) => {
       slide.addShape(pptx.ShapeType.rect, {
         x: 0, y: 0, w: '100%', h: 1.0,
         fill: { color: PRIMARY },
       });
       slide.addText(title, {
-        x: 0.4, y: 0.1, w: '90%', h: 0.8,
+        x: 0.5, y: 0.08, w: '85%', h: subtitle ? 0.5 : 0.8,
         fontSize: 22, bold: true, color: WHITE, fontFace: 'Calibri',
+      });
+      if (subtitle) {
+        slide.addText(subtitle, {
+          x: 0.5, y: 0.52, w: '85%', h: 0.4,
+          fontSize: 13, color: 'a8d4f5', fontFace: 'Calibri',
+        });
+      }
+      // Accent line under header
+      slide.addShape(pptx.ShapeType.rect, {
+        x: 0, y: 1.0, w: '100%', h: 0.04,
+        fill: { color: ACCENT },
+      });
+    };
+
+    const addFooter = (slide, text) => {
+      slide.addText(text || `${clientName} — Benefits Analysis`, {
+        x: 0.3, y: 7.15, w: 9.4, h: 0.3,
+        fontSize: 8, color: MUTED, italic: true, align: 'right',
       });
     };
 
     // ── Slide 1: Title ──
     const s1 = pptx.addSlide();
     s1.addShape(pptx.ShapeType.rect, { x: 0, y: 0, w: '100%', h: '100%', fill: { color: PRIMARY } });
+    // Accent stripe
+    s1.addShape(pptx.ShapeType.rect, { x: 0, y: 3.4, w: '100%', h: 0.06, fill: { color: ACCENT } });
     s1.addText('Benefits Plan Analysis', {
-      x: 0.5, y: 1.5, w: '90%', h: 1.2,
-      fontSize: 40, bold: true, color: WHITE, align: 'center',
+      x: 0.5, y: 1.2, w: '90%', h: 1.2,
+      fontSize: 42, bold: true, color: WHITE, align: 'center', fontFace: 'Calibri',
     });
     s1.addText(clientName, {
-      x: 0.5, y: 3.0, w: '90%', h: 0.7,
-      fontSize: 26, color: 'a8d4f5', align: 'center',
+      x: 0.5, y: 2.5, w: '90%', h: 0.7,
+      fontSize: 28, color: 'a8d4f5', align: 'center', fontFace: 'Calibri',
     });
     if (effectiveDate) {
       s1.addText(`Effective: ${effectiveDate}`, {
-        x: 0.5, y: 3.8, w: '90%', h: 0.5,
+        x: 0.5, y: 3.7, w: '90%', h: 0.5,
         fontSize: 18, color: 'c0d8f0', align: 'center',
       });
     }
-    s1.addText('Prepared by: Your Benefits Brokerage', {
-      x: 0.5, y: 5.8, w: '90%', h: 0.4,
+    s1.addText('Confidential — Prepared for Decision Makers', {
+      x: 0.5, y: 5.0, w: '90%', h: 0.4,
       fontSize: 13, color: '7fa8cc', align: 'center', italic: true,
+    });
+    s1.addShape(pptx.ShapeType.rect, { x: 3.5, y: 5.8, w: 3.0, h: 0.04, fill: { color: ACCENT } });
+    s1.addText('Prepared by Your Benefits Brokerage', {
+      x: 0.5, y: 6.0, w: '90%', h: 0.4,
+      fontSize: 12, color: '7fa8cc', align: 'center',
     });
 
     // ── Slide 2: Case Summary ──
     const s2 = pptx.addSlide();
-    addSlideHeader(s2, 'Case Summary');
+    addSlideHeader(s2, 'Case Summary', `${clientName} ${effectiveDate ? '— Effective ' + effectiveDate : ''}`);
     const carriers = [...new Set(plans.map(p => p.carrier).filter(Boolean))];
+    const freqLabel = { weekly: 'Weekly', biweekly: 'Bi-Weekly', semimonthly: 'Semi-Monthly', monthly: 'Monthly' };
     const summaryRows = [
       ['Client', clientName],
       ['Effective Date', effectiveDate || 'Not specified'],
@@ -697,138 +2356,346 @@ app.post('/export/pptx', authMiddleware, async (req, res) => {
       ['Census — EC (Emp + Child)', String(census.ec || 0)],
       ['Census — EF (Family)', String(census.ef || 0)],
       ['Total Enrolled', String((census.ee || 0) + (census.es || 0) + (census.ec || 0) + (census.ef || 0))],
+      ['Payroll Frequency', freqLabel[contributionConfig.payrollFrequency] || 'Bi-Weekly'],
     ];
+    // Summary table with alternating rows
     summaryRows.forEach(([label, value], i) => {
-      const yPos = 1.2 + i * 0.55;
+      const yPos = 1.25 + i * 0.52;
       const bg = i % 2 === 0 ? LIGHT : WHITE;
-      s2.addShape(pptx.ShapeType.rect, { x: 0.3, y: yPos, w: 9.4, h: 0.5, fill: { color: bg }, line: { color: 'dddddd', width: 0.5 } });
-      s2.addText(label, { x: 0.4, y: yPos + 0.08, w: 4.5, h: 0.35, fontSize: 13, bold: true, color: TEXT_DARK });
-      s2.addText(value, { x: 5.0, y: yPos + 0.08, w: 4.5, h: 0.35, fontSize: 13, color: TEXT_DARK });
+      s2.addShape(pptx.ShapeType.rect, { x: 0.5, y: yPos, w: 9.0, h: 0.48, fill: { color: bg }, line: { color: 'dddddd', width: 0.5 }, rectRadius: 0.03 });
+      s2.addText(label, { x: 0.65, y: yPos + 0.07, w: 4.2, h: 0.35, fontSize: 12, bold: true, color: TEXT_DARK });
+      s2.addText(value, { x: 5.0, y: yPos + 0.07, w: 4.3, h: 0.35, fontSize: 12, color: ACCENT, bold: true });
     });
+    addFooter(s2);
 
     // ── Slides 3-5: Top Recommendations ──
+    const rankLabels = ['Top Pick', 'Runner-Up', 'Strong Alternative'];
+    const rankColors = [GOLD, SILVER, BRONZE];
+    const tierLabels = { ee: 'EE Only', es: 'EE + Spouse', ec: 'EE + Child(ren)', ef: 'Family' };
+    const payPeriodsMap = PAY_PERIODS_PER_MONTH[contributionConfig.payrollFrequency] || PAY_PERIODS_PER_MONTH.biweekly;
+
     recommendations.slice(0, 3).forEach((plan, idx) => {
       const s = pptx.addSlide();
-      const rankColors = ['d4af37', '9e9e9e', 'cd7f32'];
-      const rankColor = rankColors[idx] || ACCENT;
-      addSlideHeader(s, `Recommendation #${idx + 1}`);
-      s.addShape(pptx.ShapeType.ellipse, { x: 0.3, y: 1.1, w: 0.8, h: 0.8, fill: { color: rankColor } });
-      s.addText(String(idx + 1), { x: 0.3, y: 1.2, w: 0.8, h: 0.6, fontSize: 20, bold: true, color: WHITE, align: 'center' });
+      const label = plan.recommendationLabel || rankLabels[idx] || `Recommendation #${idx + 1}`;
+      const isLowest = label === 'Lowest Cost Option';
+      const badgeColor = isLowest ? GREEN : (rankColors[idx] || ACCENT);
 
-      s.addText(plan.planName || 'Unknown Plan', { x: 1.3, y: 1.1, w: 8.0, h: 0.55, fontSize: 22, bold: true, color: PRIMARY });
-      s.addText(plan.carrier || '', { x: 1.3, y: 1.65, w: 8.0, h: 0.4, fontSize: 15, color: '555555' });
+      addSlideHeader(s, label, `${plan.carrier || 'Unknown Carrier'} — ${plan.planName || 'Unknown Plan'}`);
 
-      const scoreBar = Math.round((plan.totalScore || 0) * 100);
-      s.addShape(pptx.ShapeType.rect, { x: 0.3, y: 2.2, w: 9.4, h: 0.35, fill: { color: 'e0e0e0' } });
-      s.addShape(pptx.ShapeType.rect, { x: 0.3, y: 2.2, w: 9.4 * (plan.totalScore || 0), h: 0.35, fill: { color: ACCENT } });
-      s.addText(`Score: ${scoreBar}/100`, { x: 0.3, y: 2.2, w: 9.4, h: 0.35, fontSize: 12, bold: true, color: WHITE, align: 'center' });
+      // Score bar
+      const scoreVal = Math.round((plan.totalScore || 0) * 100);
+      s.addShape(pptx.ShapeType.rect, { x: 0.5, y: 1.2, w: 9.0, h: 0.32, fill: { color: 'e0e0e0' }, rectRadius: 0.08 });
+      s.addShape(pptx.ShapeType.rect, { x: 0.5, y: 1.2, w: Math.max(0.3, 9.0 * (plan.totalScore || 0)), h: 0.32, fill: { color: badgeColor }, rectRadius: 0.08 });
+      s.addText(`Score: ${scoreVal}/100`, { x: 0.5, y: 1.2, w: 9.0, h: 0.32, fontSize: 11, bold: true, color: WHITE, align: 'center' });
 
-      const detailRows = [
-        ['Network Type', plan.networkType || '—'],
+      // ── Left column: Plan Details ──
+      const leftX = 0.5;
+      const colW = 4.3;
+      s.addText('PLAN DETAILS', { x: leftX, y: 1.72, w: colW, h: 0.3, fontSize: 9, bold: true, color: ACCENT, letterSpacing: 1.5 });
+
+      const details = [
+        ['Network', plan.networkType || '—'],
         ['Metal Level', plan.metalLevel || '—'],
-        ['Deductible (Ind)', plan.deductibleIndividual != null ? `$${plan.deductibleIndividual.toLocaleString()}` : '—'],
-        ['OOP Max (Ind)', plan.oopMaxIndividual != null ? `$${plan.oopMaxIndividual.toLocaleString()}` : '—'],
+        ['Deductible (Ind)', fmtInt(plan.deductibleIndividual)],
+        ['OOP Max (Ind)', fmtInt(plan.oopMaxIndividual)],
         ['PCP Copay', plan.copayPCP != null ? `$${plan.copayPCP}` : '—'],
         ['Specialist Copay', plan.copaySpecialist != null ? `$${plan.copaySpecialist}` : '—'],
-        ['EE Monthly Premium', plan.premiumEE != null ? `$${plan.premiumEE.toFixed(2)}` : '—'],
-        ['Family Monthly Premium', plan.premiumEF != null ? `$${plan.premiumEF.toFixed(2)}` : '—'],
+        ['Coinsurance', plan.coinsurance != null ? `${plan.coinsurance}%` : '—'],
       ];
-      detailRows.forEach(([label, value], i) => {
-        const col = i < 4 ? 0 : 1;
-        const row = i % 4;
-        const xPos = col === 0 ? 0.3 : 5.1;
-        const yPos = 2.8 + row * 0.65;
-        s.addShape(pptx.ShapeType.rect, { x: xPos, y: yPos, w: 4.5, h: 0.55, fill: { color: i % 2 === 0 ? LIGHT : WHITE }, line: { color: 'dddddd', width: 0.5 } });
-        s.addText(label, { x: xPos + 0.1, y: yPos + 0.08, w: 2.2, h: 0.4, fontSize: 11, bold: true, color: TEXT_DARK });
-        s.addText(value, { x: xPos + 2.3, y: yPos + 0.08, w: 2.1, h: 0.4, fontSize: 11, color: ACCENT });
+      details.forEach(([lbl, val], i) => {
+        const yPos = 2.02 + i * 0.4;
+        const bg = i % 2 === 0 ? LIGHT : WHITE;
+        s.addShape(pptx.ShapeType.rect, { x: leftX, y: yPos, w: colW, h: 0.38, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+        s.addText(lbl, { x: leftX + 0.1, y: yPos + 0.05, w: 2.0, h: 0.28, fontSize: 10, bold: true, color: TEXT_DARK });
+        s.addText(val, { x: leftX + 2.1, y: yPos + 0.05, w: 2.0, h: 0.28, fontSize: 10, color: ACCENT, bold: true, align: 'right' });
       });
 
+      // ── Right column: Composite Monthly Rates ──
+      const rightX = 5.2;
+      const rightW = 4.3;
+      s.addText('COMPOSITE MONTHLY RATES', { x: rightX, y: 1.72, w: rightW, h: 0.3, fontSize: 9, bold: true, color: ACCENT, letterSpacing: 1.5 });
+
+      const rates = [
+        ['EE Only', fmtDol(plan.premiumEE)],
+        ['EE + Spouse', fmtDol(plan.premiumES)],
+        ['EE + Child(ren)', fmtDol(plan.premiumEC)],
+        ['Family', fmtDol(plan.premiumEF)],
+      ];
+      rates.forEach(([lbl, val], i) => {
+        const yPos = 2.02 + i * 0.4;
+        const bg = i % 2 === 0 ? LIGHT : WHITE;
+        s.addShape(pptx.ShapeType.rect, { x: rightX, y: yPos, w: rightW, h: 0.38, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+        s.addText(lbl, { x: rightX + 0.1, y: yPos + 0.05, w: 2.0, h: 0.28, fontSize: 10, bold: true, color: TEXT_DARK });
+        s.addText(val, { x: rightX + 2.1, y: yPos + 0.05, w: 2.0, h: 0.28, fontSize: 10, color: ACCENT, bold: true, align: 'right' });
+      });
+
+      // ── Per Employee Per Pay Period Section ──
+      const shares = calculatePlanCostShares(plan, census, contributionConfig);
+      const payFreqLabel = freqLabel[shares.payrollFrequency] || 'Bi-Weekly';
+      const ppY = 3.85;
+
+      s.addText(`PER EMPLOYEE PER PAY PERIOD (${payFreqLabel.toUpperCase()})`, { x: 0.5, y: ppY, w: 9.0, h: 0.3, fontSize: 9, bold: true, color: ACCENT, letterSpacing: 1.5 });
+
+      // Header row
+      const ppHeaderY = ppY + 0.3;
+      s.addShape(pptx.ShapeType.rect, { x: 0.5, y: ppHeaderY, w: 9.0, h: 0.35, fill: { color: PRIMARY } });
+      s.addText('Coverage Tier', { x: 0.6, y: ppHeaderY + 0.05, w: 2.5, h: 0.25, fontSize: 9, bold: true, color: WHITE });
+      s.addText('Monthly Rate', { x: 3.2, y: ppHeaderY + 0.05, w: 1.8, h: 0.25, fontSize: 9, bold: true, color: WHITE, align: 'center' });
+      s.addText('Employer Pays', { x: 5.1, y: ppHeaderY + 0.05, w: 2.0, h: 0.25, fontSize: 9, bold: true, color: WHITE, align: 'center' });
+      s.addText('Employee Pays', { x: 7.2, y: ppHeaderY + 0.05, w: 2.0, h: 0.25, fontSize: 9, bold: true, color: WHITE, align: 'center' });
+
+      // Tier rows
+      const tierKeys = ['ee', 'es', 'ec', 'ef'];
+      tierKeys.forEach((tier, i) => {
+        const td = shares.byTier[tier];
+        const yPos = ppHeaderY + 0.37 + i * 0.38;
+        const bg = i % 2 === 0 ? LIGHT : WHITE;
+        s.addShape(pptx.ShapeType.rect, { x: 0.5, y: yPos, w: 9.0, h: 0.36, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+        s.addText(tierLabels[tier], { x: 0.6, y: yPos + 0.05, w: 2.5, h: 0.26, fontSize: 10, bold: true, color: TEXT_DARK });
+        s.addText(fmtDol(td.premiumPerMemberMonthly), { x: 3.2, y: yPos + 0.05, w: 1.8, h: 0.26, fontSize: 10, color: TEXT_DARK, align: 'center' });
+        s.addText(fmtDol(td.employerPerMemberMonthly / payPeriodsMap), { x: 5.1, y: yPos + 0.05, w: 2.0, h: 0.26, fontSize: 10, bold: true, color: PRIMARY, align: 'center' });
+        s.addText(fmtDol(td.employeePerMemberMonthly / payPeriodsMap), { x: 7.2, y: yPos + 0.05, w: 2.0, h: 0.26, fontSize: 10, bold: true, color: ORANGE, align: 'center' });
+      });
+
+      // ── Aggregate totals bar ──
+      const aggY = ppHeaderY + 0.37 + 4 * 0.38 + 0.15;
+      s.addShape(pptx.ShapeType.rect, { x: 0.5, y: aggY, w: 4.3, h: 0.55, fill: { color: 'e8f4fd' }, line: { color: ACCENT, width: 1 }, rectRadius: 0.05 });
+      s.addText('Employer Aggregate / Pay Period', { x: 0.6, y: aggY + 0.03, w: 4.0, h: 0.2, fontSize: 8, bold: true, color: MUTED });
+      s.addText(fmtDol(shares.employerPerPayTotal), { x: 0.6, y: aggY + 0.22, w: 4.0, h: 0.28, fontSize: 14, bold: true, color: PRIMARY });
+
+      s.addShape(pptx.ShapeType.rect, { x: 5.2, y: aggY, w: 4.3, h: 0.55, fill: { color: 'fef5e7' }, line: { color: ORANGE, width: 1 }, rectRadius: 0.05 });
+      s.addText('Employee Aggregate / Pay Period', { x: 5.3, y: aggY + 0.03, w: 4.0, h: 0.2, fontSize: 8, bold: true, color: MUTED });
+      s.addText(fmtDol(shares.employeePerPayTotal), { x: 5.3, y: aggY + 0.22, w: 4.0, h: 0.28, fontSize: 14, bold: true, color: ORANGE });
+
+      // Why recommended
       if (plan.whyRecommended) {
-        s.addShape(pptx.ShapeType.rect, { x: 0.3, y: 5.5, w: 9.4, h: 0.9, fill: { color: 'e8f4fd' }, line: { color: ACCENT, width: 1 } });
-        s.addText(`💡 ${plan.whyRecommended}`, { x: 0.5, y: 5.55, w: 9.0, h: 0.8, fontSize: 12, italic: true, color: PRIMARY });
+        const whyY = aggY + 0.7;
+        s.addShape(pptx.ShapeType.rect, { x: 0.5, y: whyY, w: 9.0, h: 0.55, fill: { color: 'e8f4fd' }, line: { color: ACCENT, width: 0.5 }, rectRadius: 0.05 });
+        s.addText(plan.whyRecommended, { x: 0.7, y: whyY + 0.05, w: 8.6, h: 0.45, fontSize: 10, italic: true, color: PRIMARY });
       }
+
+      addFooter(s);
     });
 
-    // ── Slide 6: Comparison Table ──
+    // ── Slide 6: Side-by-Side Comparison ──
     const s6 = pptx.addSlide();
-    addSlideHeader(s6, 'Plan Comparison Table');
     const compPlans = recommendations.slice(0, 3);
-    const rowLabels = ['Carrier', 'Network', 'Metal Level', 'Deductible (Ind)', 'OOP Max (Ind)', 'PCP Copay', 'Specialist Copay', 'ER Copay', 'EE Premium', 'Family Premium'];
+    const compLabels = compPlans.map((p, i) => p.recommendationLabel || rankLabels[i] || `#${i + 1}`);
+    addSlideHeader(s6, 'Plan Comparison', `Side-by-side view of ${compPlans.length} recommended plans`);
+
+    const rowLabels = [
+      'Carrier', 'Network', 'Metal Level', 'Deductible (Ind)', 'OOP Max (Ind)',
+      'PCP Copay', 'Specialist Copay', 'Coinsurance',
+      'EE Premium/mo', 'EE+Spouse/mo', 'EE+Child/mo', 'Family/mo',
+    ];
     const getVal = (plan, label) => {
-      const m = v => v != null ? `$${Number(v).toLocaleString()}` : '—';
       switch (label) {
         case 'Carrier': return plan.carrier || '—';
         case 'Network': return plan.networkType || '—';
         case 'Metal Level': return plan.metalLevel || '—';
-        case 'Deductible (Ind)': return m(plan.deductibleIndividual);
-        case 'OOP Max (Ind)': return m(plan.oopMaxIndividual);
+        case 'Deductible (Ind)': return fmtInt(plan.deductibleIndividual);
+        case 'OOP Max (Ind)': return fmtInt(plan.oopMaxIndividual);
         case 'PCP Copay': return plan.copayPCP != null ? `$${plan.copayPCP}` : '—';
         case 'Specialist Copay': return plan.copaySpecialist != null ? `$${plan.copaySpecialist}` : '—';
-        case 'ER Copay': return plan.copayER != null ? `$${plan.copayER}` : '—';
-        case 'EE Premium': return plan.premiumEE != null ? `$${plan.premiumEE.toFixed(2)}` : '—';
-        case 'Family Premium': return plan.premiumEF != null ? `$${plan.premiumEF.toFixed(2)}` : '—';
+        case 'Coinsurance': return plan.coinsurance != null ? `${plan.coinsurance}%` : '—';
+        case 'EE Premium/mo': return fmtDol(plan.premiumEE);
+        case 'EE+Spouse/mo': return fmtDol(plan.premiumES);
+        case 'EE+Child/mo': return fmtDol(plan.premiumEC);
+        case 'Family/mo': return fmtDol(plan.premiumEF);
         default: return '—';
       }
     };
 
-    // Header row
     const colW = 2.5;
-    const startX = 0.3;
-    s6.addShape(pptx.ShapeType.rect, { x: startX, y: 1.1, w: 2.2, h: 0.5, fill: { color: PRIMARY } });
-    s6.addText('Benefit', { x: startX, y: 1.15, w: 2.2, h: 0.4, fontSize: 12, bold: true, color: WHITE, align: 'center' });
+    const startX = 0.5;
+    const labelColW = 2.2;
+
+    // Header row
+    s6.addShape(pptx.ShapeType.rect, { x: startX, y: 1.18, w: labelColW, h: 0.45, fill: { color: PRIMARY } });
+    s6.addText('Benefit', { x: startX, y: 1.21, w: labelColW, h: 0.38, fontSize: 10, bold: true, color: WHITE, align: 'center' });
     compPlans.forEach((plan, ci) => {
-      const cx = startX + 2.2 + ci * colW;
-      s6.addShape(pptx.ShapeType.rect, { x: cx, y: 1.1, w: colW, h: 0.5, fill: { color: ACCENT } });
-      s6.addText(`#${ci + 1}: ${(plan.planName || 'Plan').substring(0, 18)}`, { x: cx, y: 1.15, w: colW, h: 0.4, fontSize: 10, bold: true, color: WHITE, align: 'center' });
+      const cx = startX + labelColW + ci * colW;
+      const badgeColor = (plan.recommendationLabel === 'Lowest Cost Option') ? GREEN : (rankColors[ci] || ACCENT);
+      s6.addShape(pptx.ShapeType.rect, { x: cx, y: 1.18, w: colW, h: 0.45, fill: { color: badgeColor } });
+      s6.addText(`${compLabels[ci]}`, { x: cx, y: 1.18, w: colW, h: 0.22, fontSize: 8, bold: true, color: WHITE, align: 'center' });
+      s6.addText(`${(plan.planName || 'Plan').substring(0, 22)}`, { x: cx, y: 1.38, w: colW, h: 0.22, fontSize: 9, color: WHITE, align: 'center' });
     });
 
     rowLabels.forEach((label, ri) => {
-      const yPos = 1.65 + ri * 0.52;
+      const yPos = 1.66 + ri * 0.43;
       const bg = ri % 2 === 0 ? LIGHT : WHITE;
-      s6.addShape(pptx.ShapeType.rect, { x: startX, y: yPos, w: 2.2, h: 0.48, fill: { color: bg }, line: { color: 'dddddd', width: 0.5 } });
-      s6.addText(label, { x: startX + 0.05, y: yPos + 0.08, w: 2.1, h: 0.35, fontSize: 10, bold: true, color: TEXT_DARK });
+      const isPremiumRow = ri >= 8;
+      s6.addShape(pptx.ShapeType.rect, { x: startX, y: yPos, w: labelColW, h: 0.41, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+      s6.addText(label, { x: startX + 0.08, y: yPos + 0.07, w: labelColW - 0.1, h: 0.28, fontSize: 9, bold: true, color: TEXT_DARK });
       compPlans.forEach((plan, ci) => {
-        const cx = startX + 2.2 + ci * colW;
-        s6.addShape(pptx.ShapeType.rect, { x: cx, y: yPos, w: colW, h: 0.48, fill: { color: bg }, line: { color: 'dddddd', width: 0.5 } });
-        s6.addText(getVal(plan, label), { x: cx + 0.05, y: yPos + 0.08, w: colW - 0.1, h: 0.35, fontSize: 10, color: TEXT_DARK, align: 'center' });
+        const cx = startX + labelColW + ci * colW;
+        s6.addShape(pptx.ShapeType.rect, { x: cx, y: yPos, w: colW, h: 0.41, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+        s6.addText(getVal(plan, label), { x: cx + 0.05, y: yPos + 0.07, w: colW - 0.1, h: 0.28, fontSize: 9, color: isPremiumRow ? ACCENT : TEXT_DARK, bold: isPremiumRow, align: 'center' });
       });
     });
+    addFooter(s6);
 
-    // ── Slide 7: Monthly Premium Summary ──
+    // ── Slide 7: Per-Employee Cost Breakdown ──
     const s7 = pptx.addSlide();
-    addSlideHeader(s7, 'Monthly Premium Summary');
-    const premRows = [
-      ['Tier', 'Count', ...compPlans.map(p => (p.planName || 'Plan').substring(0, 16))],
-      ['EE (Employee Only)', String(census.ee || 0), ...compPlans.map(p => p.premiumEE != null ? `$${p.premiumEE.toFixed(2)}` : '—')],
-      ['ES (Emp + Spouse)', String(census.es || 0), ...compPlans.map(p => p.premiumES != null ? `$${p.premiumES.toFixed(2)}` : '—')],
-      ['EC (Emp + Child)', String(census.ec || 0), ...compPlans.map(p => p.premiumEC != null ? `$${p.premiumEC.toFixed(2)}` : '—')],
-      ['EF (Family)', String(census.ef || 0), ...compPlans.map(p => p.premiumEF != null ? `$${p.premiumEF.toFixed(2)}` : '—')],
-      ['Est. Monthly Total', '', ...compPlans.map(p => p.monthlyTotalCost != null ? `$${p.monthlyTotalCost.toFixed(2)}` : '—')],
+    const payFreqLbl = freqLabel[contributionConfig.payrollFrequency] || 'Bi-Weekly';
+    addSlideHeader(s7, 'Per-Employee Cost Breakdown', `What each employee pays per ${payFreqLbl.toLowerCase()} pay period`);
+
+    // Build contribution rules summary line
+    const contribDescParts = COVERAGE_TIERS.map(t => {
+      const rule = contributionConfig.tiers[t] || { type: 'percent', value: 0 };
+      const lbl = { ee: 'EE', es: 'ES', ec: 'EC', ef: 'EF' }[t];
+      return rule.type === 'dollar' ? `${lbl}: $${rule.value}` : `${lbl}: ${rule.value}%`;
+    });
+    s7.addText(`Employer Contribution: ${contribDescParts.join('  |  ')}  •  Payroll: ${payFreqLbl}`, {
+      x: 0.5, y: 1.15, w: 9.0, h: 0.3, fontSize: 9, color: MUTED, italic: true,
+    });
+
+    const ppColW = 2.1;
+    const ppLabelW = 2.8;
+    const ppStartX = 0.5;
+    const ppTiers = ['ee', 'es', 'ec', 'ef'];
+
+    // One table per recommended plan
+    compPlans.forEach((plan, pi) => {
+      const blockY = 1.6 + pi * 2.0;
+      const shares = calculatePlanCostShares(plan, census, contributionConfig);
+      const planLabel = plan.recommendationLabel || rankLabels[pi] || `Plan ${pi + 1}`;
+      const badgeColor = (plan.recommendationLabel === 'Lowest Cost Option') ? GREEN : (rankColors[pi] || ACCENT);
+
+      // Plan label bar
+      s7.addShape(pptx.ShapeType.rect, { x: ppStartX, y: blockY, w: 9.0, h: 0.35, fill: { color: badgeColor } });
+      s7.addText(`${planLabel}: ${(plan.planName || 'Plan').substring(0, 40)}`, { x: ppStartX + 0.1, y: blockY + 0.04, w: 8.8, h: 0.28, fontSize: 10, bold: true, color: WHITE });
+
+      // Table header
+      const hdrY = blockY + 0.37;
+      s7.addShape(pptx.ShapeType.rect, { x: ppStartX, y: hdrY, w: ppLabelW, h: 0.3, fill: { color: PRIMARY } });
+      s7.addText('Tier', { x: ppStartX + 0.08, y: hdrY + 0.04, w: ppLabelW - 0.1, h: 0.22, fontSize: 9, bold: true, color: WHITE });
+      ['Monthly Rate', 'Employer / Pay', 'Employee / Pay'].forEach((hdr, hi) => {
+        const hx = ppStartX + ppLabelW + hi * ppColW;
+        s7.addShape(pptx.ShapeType.rect, { x: hx, y: hdrY, w: ppColW, h: 0.3, fill: { color: PRIMARY } });
+        s7.addText(hdr, { x: hx, y: hdrY + 0.04, w: ppColW, h: 0.22, fontSize: 9, bold: true, color: WHITE, align: 'center' });
+      });
+
+      // Data rows
+      ppTiers.forEach((tier, ti) => {
+        const td = shares.byTier[tier];
+        const rY = hdrY + 0.32 + ti * 0.3;
+        const bg = ti % 2 === 0 ? LIGHT : WHITE;
+        s7.addShape(pptx.ShapeType.rect, { x: ppStartX, y: rY, w: ppLabelW, h: 0.28, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+        s7.addText(tierLabels[tier], { x: ppStartX + 0.08, y: rY + 0.03, w: ppLabelW - 0.1, h: 0.22, fontSize: 9, bold: true, color: TEXT_DARK });
+        const vals = [
+          fmtDol(td.premiumPerMemberMonthly),
+          fmtDol(td.employerPerMemberMonthly / payPeriodsMap),
+          fmtDol(td.employeePerMemberMonthly / payPeriodsMap),
+        ];
+        vals.forEach((v, vi) => {
+          const vx = ppStartX + ppLabelW + vi * ppColW;
+          s7.addShape(pptx.ShapeType.rect, { x: vx, y: rY, w: ppColW, h: 0.28, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+          s7.addText(v, { x: vx, y: rY + 0.03, w: ppColW, h: 0.22, fontSize: 9, bold: true, color: vi === 1 ? PRIMARY : vi === 2 ? ORANGE : TEXT_DARK, align: 'center' });
+        });
+      });
+    });
+    addFooter(s7);
+
+    // ── Slide 8: Monthly Premium Summary (aggregate) ──
+    const s8 = pptx.addSlide();
+    addSlideHeader(s8, 'Aggregate Monthly Costs', `Total employer and employee costs across all enrolled members`);
+
+    const premColW = 2.2;
+    const premStartX = 0.5;
+    const premHeaders = ['Tier', 'Enrolled', ...compPlans.map((p, i) => (p.recommendationLabel || rankLabels[i] || `Plan ${i+1}`).substring(0, 16))];
+
+    // Header
+    premHeaders.forEach((hdr, hi) => {
+      const hx = premStartX + hi * premColW;
+      const w = hi === 0 ? premColW : premColW;
+      s8.addShape(pptx.ShapeType.rect, { x: hx, y: 1.2, w, h: 0.45, fill: { color: PRIMARY } });
+      s8.addText(hdr, { x: hx + 0.05, y: 1.24, w: w - 0.1, h: 0.36, fontSize: 9, bold: true, color: WHITE, align: hi === 0 ? 'left' : 'center' });
+    });
+
+    const tierCensus = { ee: census.ee || 0, es: census.es || 0, ec: census.ec || 0, ef: census.ef || 0 };
+    const premierTiers = [
+      { key: 'ee', label: 'EE Only', field: 'premiumEE' },
+      { key: 'es', label: 'EE + Spouse', field: 'premiumES' },
+      { key: 'ec', label: 'EE + Child(ren)', field: 'premiumEC' },
+      { key: 'ef', label: 'Family', field: 'premiumEF' },
     ];
-    premRows.forEach((row, ri) => {
-      const isHeader = ri === 0;
-      const yPos = 1.2 + ri * 0.7;
-      const bg = isHeader ? PRIMARY : (ri % 2 === 0 ? LIGHT : WHITE);
-      const fc = isHeader ? WHITE : TEXT_DARK;
-      row.forEach((cell, ci) => {
-        const xPos = 0.3 + ci * 2.3;
-        s7.addShape(pptx.ShapeType.rect, { x: xPos, y: yPos, w: 2.2, h: 0.6, fill: { color: bg }, line: { color: 'dddddd', width: 0.5 } });
-        s7.addText(cell, { x: xPos + 0.05, y: yPos + 0.1, w: 2.1, h: 0.45, fontSize: isHeader ? 11 : 12, bold: isHeader, color: fc, align: ci === 0 ? 'left' : 'center' });
+
+    premierTiers.forEach(({ key, label, field }, ri) => {
+      const yPos = 1.7 + ri * 0.42;
+      const bg = ri % 2 === 0 ? LIGHT : WHITE;
+      // Tier label
+      s8.addShape(pptx.ShapeType.rect, { x: premStartX, y: yPos, w: premColW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+      s8.addText(label, { x: premStartX + 0.08, y: yPos + 0.07, w: premColW - 0.1, h: 0.26, fontSize: 10, bold: true, color: TEXT_DARK });
+      // Enrolled
+      s8.addShape(pptx.ShapeType.rect, { x: premStartX + premColW, y: yPos, w: premColW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+      s8.addText(String(tierCensus[key]), { x: premStartX + premColW, y: yPos + 0.07, w: premColW, h: 0.26, fontSize: 10, color: TEXT_DARK, align: 'center' });
+      // Plan premiums
+      compPlans.forEach((plan, ci) => {
+        const cx = premStartX + (2 + ci) * premColW;
+        s8.addShape(pptx.ShapeType.rect, { x: cx, y: yPos, w: premColW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+        s8.addText(fmtDol(plan[field]), { x: cx, y: yPos + 0.07, w: premColW, h: 0.26, fontSize: 10, bold: true, color: ACCENT, align: 'center' });
       });
     });
 
-    // ── Slide 8: Appendix ──
-    const s8 = pptx.addSlide();
-    addSlideHeader(s8, 'Appendix — All Plans Analyzed');
-    const allPlansList = (recData.allPlans || plans).slice(0, 15);
+    // Totals section
+    const totY = 1.7 + 4 * 0.42 + 0.15;
+    const totalRowLabels = ['Est. Monthly Total', `Employer / ${payFreqLbl}`, `Employee / ${payFreqLbl}`];
+    const totalRowColors = [TEXT_DARK, PRIMARY, ORANGE];
+    totalRowLabels.forEach((lbl, ri) => {
+      const yPos = totY + ri * 0.42;
+      s8.addShape(pptx.ShapeType.rect, { x: premStartX, y: yPos, w: premColW * 2, h: 0.4, fill: { color: ri === 0 ? PRIMARY : 'e8f4fd' }, line: { color: 'e8e8e8', width: 0.3 } });
+      s8.addText(lbl, { x: premStartX + 0.08, y: yPos + 0.07, w: premColW * 2 - 0.1, h: 0.26, fontSize: 10, bold: true, color: ri === 0 ? WHITE : totalRowColors[ri] });
+      compPlans.forEach((plan, ci) => {
+        const cx = premStartX + (2 + ci) * premColW;
+        let val;
+        if (ri === 0) val = fmtDol(plan.monthlyTotalCost);
+        else if (ri === 1) val = fmtDol(plan.employerPerPayCost);
+        else val = fmtDol(plan.employeePerPayCost);
+        const bg = ri === 0 ? PRIMARY : 'e8f4fd';
+        s8.addShape(pptx.ShapeType.rect, { x: cx, y: yPos, w: premColW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+        s8.addText(val, { x: cx, y: yPos + 0.07, w: premColW, h: 0.26, fontSize: 10, bold: true, color: ri === 0 ? WHITE : totalRowColors[ri], align: 'center' });
+      });
+    });
+    addFooter(s8);
+
+    // ── Slide 9: Appendix — All Plans ──
+    const s9 = pptx.addSlide();
+    addSlideHeader(s9, 'Appendix', 'All plans analyzed, ranked by overall score');
+    const allPlansList = (recData.allPlans || plans).slice(0, 13);
+
+    // Mini table header
+    const appColWidths = [0.4, 3.0, 1.5, 1.0, 1.2, 1.2, 1.6];
+    const appHeaders = ['#', 'Plan Name', 'Network', 'Metal', 'Deductible', 'OOP Max', 'EE Premium'];
+    const appStartY = 1.2;
+    let appX = 0.3;
+    appHeaders.forEach((hdr, hi) => {
+      s9.addShape(pptx.ShapeType.rect, { x: appX, y: appStartY, w: appColWidths[hi], h: 0.35, fill: { color: PRIMARY } });
+      s9.addText(hdr, { x: appX + 0.04, y: appStartY + 0.05, w: appColWidths[hi] - 0.08, h: 0.25, fontSize: 8, bold: true, color: WHITE, align: hi === 0 ? 'center' : 'left' });
+      appX += appColWidths[hi];
+    });
+
     allPlansList.forEach((plan, i) => {
-      const yPos = 1.1 + i * 0.45;
+      const yPos = appStartY + 0.37 + i * 0.38;
       if (yPos > 7.0) return;
       const bg = i % 2 === 0 ? LIGHT : WHITE;
-      s8.addShape(pptx.ShapeType.rect, { x: 0.3, y: yPos, w: 9.4, h: 0.42, fill: { color: bg }, line: { color: 'dddddd', width: 0.3 } });
-      const label = `${i + 1}. ${plan.carrier || '—'}  |  ${plan.planName || '—'}  |  ${plan.networkType || '—'}  |  Score: ${plan.totalScore != null ? Math.round(plan.totalScore * 100) : '—'}`;
-      s8.addText(label, { x: 0.4, y: yPos + 0.06, w: 9.2, h: 0.32, fontSize: 11, color: TEXT_DARK });
+      const vals = [
+        String(i + 1),
+        `${plan.carrier || ''} — ${(plan.planName || '').substring(0, 28)}`,
+        plan.networkType || '—',
+        plan.metalLevel || '—',
+        fmtInt(plan.deductibleIndividual),
+        fmtInt(plan.oopMaxIndividual),
+        fmtDol(plan.premiumEE),
+      ];
+      let vx = 0.3;
+      vals.forEach((val, vi) => {
+        s9.addShape(pptx.ShapeType.rect, { x: vx, y: yPos, w: appColWidths[vi], h: 0.36, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.2 } });
+        s9.addText(val, { x: vx + 0.04, y: yPos + 0.05, w: appColWidths[vi] - 0.08, h: 0.26, fontSize: 8, color: TEXT_DARK, align: vi === 0 ? 'center' : 'left' });
+        vx += appColWidths[vi];
+      });
     });
+    addFooter(s9);
 
     const buffer = await pptx.write({ outputType: 'nodebuffer' });
     const safeName = (clientName || 'Client').replace(/[^a-z0-9]/gi, '_');
@@ -845,16 +2712,30 @@ app.post('/export/pptx', authMiddleware, async (req, res) => {
 });
 
 // ── Export XLSX ───────────────────────────────────────────────────────────────
-app.post('/export/xlsx', authMiddleware, async (req, res) => {
+app.post('/export/xlsx', async (req, res) => {
   try {
-    const { caseId, clientName = 'Client', effectiveDate = '' } = req.body;
+    const { caseId, clientName = 'Client', effectiveDate = '', contribution } = req.body;
     if (!caseId) return res.status(400).json({ error: 'caseId is required' });
     const caseData = caseStore.get(caseId);
     if (!caseData) return res.status(404).json({ error: 'Case not found' });
 
     const plans = caseData.plans || [];
     const recData = caseData.recommendations || {};
-    const recommendations = recData.recommendations || plans.slice(0, 3).map((p, i) => ({ rank: i + 1, ...p }));
+    const contributionConfig = normalizeContributionConfig(contribution || recData.contribution || caseData.contribution || defaultContributionConfig());
+    caseData.contribution = contributionConfig;
+    const recommendations = (recData.recommendations || plans.slice(0, 3).map((p, i) => ({ rank: i + 1, ...p }))).map(plan => {
+      if (typeof plan.employerPerPayCost === 'number' && typeof plan.employeePerPayCost === 'number') return plan;
+      const shares = calculatePlanCostShares(plan, caseData.census || {}, contributionConfig);
+      return {
+        ...plan,
+        employerMonthlyCost: Math.round(shares.employerMonthlyTotal * 100) / 100,
+        employeeMonthlyCost: Math.round(shares.employeeMonthlyTotal * 100) / 100,
+        employerPerPayCost: Math.round(shares.employerPerPayTotal * 100) / 100,
+        employeePerPayCost: Math.round(shares.employeePerPayTotal * 100) / 100,
+        payrollFrequency: shares.payrollFrequency,
+        contributionBreakdown: shares.byTier,
+      };
+    });
     const census = caseData.census || {};
 
     const workbook = new ExcelJS.Workbook();
@@ -1018,6 +2899,7 @@ app.post('/export/xlsx', authMiddleware, async (req, res) => {
     // Top plans table
     const planHdrRow = 12;
     const planHdrCols = ['Rank', 'Carrier', 'Plan Name', 'Network', 'Metal', 'Score', 'Monthly Total Cost',
+      'Employer Monthly', 'Employee Monthly', 'Employer Per Pay', 'Employee Per Pay',
       'Deductible (Ind)', 'OOP Max (Ind)', 'PCP Copay', 'EE Premium', 'EF Premium', 'EE×Count', 'ES×Count', 'EC×Count', 'EF×Count'];
     planHdrCols.forEach((h, i) => {
       const cell = summSheet.getCell(planHdrRow, i + 1);
@@ -1041,6 +2923,10 @@ app.post('/export/xlsx', authMiddleware, async (req, res) => {
         plan.metalLevel,
         plan.totalScore != null ? Math.round(plan.totalScore * 100) + '/100' : '—',
         monthly > 0 ? `$${monthly.toFixed(2)}` : '—',
+        plan.employerMonthlyCost != null ? `$${Number(plan.employerMonthlyCost).toFixed(2)}` : '—',
+        plan.employeeMonthlyCost != null ? `$${Number(plan.employeeMonthlyCost).toFixed(2)}` : '—',
+        plan.employerPerPayCost != null ? `$${Number(plan.employerPerPayCost).toFixed(2)}` : '—',
+        plan.employeePerPayCost != null ? `$${Number(plan.employeePerPayCost).toFixed(2)}` : '—',
         plan.deductibleIndividual != null ? `$${plan.deductibleIndividual.toLocaleString()}` : '—',
         plan.oopMaxIndividual != null ? `$${plan.oopMaxIndividual.toLocaleString()}` : '—',
         plan.copayPCP != null ? `$${plan.copayPCP}` : '—',
@@ -1061,8 +2947,32 @@ app.post('/export/xlsx', authMiddleware, async (req, res) => {
       summSheet.getRow(rowNum).height = 22;
     });
 
+    const contributionStart = planHdrRow + 6;
+    const contributionHeader = summSheet.getCell(`A${contributionStart}`);
+    contributionHeader.value = 'Employer Contribution Setup';
+    contributionHeader.font = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11, name: 'Calibri' };
+    contributionHeader.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + ACCENT_HEX } };
+    contributionHeader.border = thinBorder;
+
+    const contributionRows = [
+      ['Payroll Frequency', contributionConfig.payrollFrequency, ''],
+      ['EE Rule', `${contributionConfig.tiers.ee.type} ${contributionConfig.tiers.ee.value}`, ''],
+      ['ES Rule', `${contributionConfig.tiers.es.type} ${contributionConfig.tiers.es.value}`, ''],
+      ['EC Rule', `${contributionConfig.tiers.ec.type} ${contributionConfig.tiers.ec.value}`, ''],
+      ['EF Rule', `${contributionConfig.tiers.ef.type} ${contributionConfig.tiers.ef.value}`, ''],
+    ];
+    contributionRows.forEach((vals, idx) => {
+      const rowNum = contributionStart + 1 + idx;
+      vals.forEach((val, ci) => {
+        const cell = summSheet.getCell(rowNum, ci + 1);
+        cell.value = val;
+        cell.fill = idx % 2 === 0 ? whiteFill : altFill;
+        cell.border = thinBorder;
+      });
+    });
+
     // Column widths for summary
-    summSheet.columns = planHdrCols.map((h, i) => ({ width: [8, 20, 28, 12, 10, 10, 18, 16, 16, 12, 12, 12, 14, 14, 14, 14][i] || 14 }));
+    summSheet.columns = planHdrCols.map((h, i) => ({ width: [8, 20, 28, 12, 10, 10, 18, 16, 16, 16, 16, 16, 16, 12, 12, 12, 14, 14, 14, 14][i] || 14 }));
 
     const xlsxBuffer = await workbook.xlsx.writeBuffer();
     const safeName = (clientName || 'Client').replace(/[^a-z0-9]/gi, '_');
