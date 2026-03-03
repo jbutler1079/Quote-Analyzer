@@ -524,9 +524,8 @@ function cleanPlanName(name) {
     cleaned = withoutCarrier;
   }
 
-  // Remove standalone alphanumeric plan code suffix at end (e.g., "B661ADTHMO", "S9E1ADTHMO")
-  // These are internal BCBS codes that appear on their own word at the end
-  cleaned = cleaned.replace(/\s+[A-Z0-9]{6,12}(?:HMO|PPO|EPO|HDHP)?$/i, '').trim();
+  // Note: Do NOT strip BCBS plan-ID suffixes (e.g., P9M1CHC, G654CHC, B661ADT)
+  // since they are the only way to differentiate plans within the same network+metal tier.
 
   return cleaned || name;
 }
@@ -1741,7 +1740,10 @@ function deduplicatePlans(plans) {
       // Carrier must match if both are set
       const carrierMatch = !plan.carrier || !existing.carrier ||
         String(plan.carrier).toLowerCase() === String(existing.carrier).toLowerCase();
-      if (nameMatch && carrierMatch) {
+      // Don't merge if both plans have distinct premium values (they are different plans)
+      const bothHavePremiums = plan.premiumEE != null && existing.premiumEE != null;
+      const premiumsDiffer = bothHavePremiums && Math.abs(plan.premiumEE - existing.premiumEE) > 0.01;
+      if (nameMatch && carrierMatch && !premiumsDiffer) {
         mergePlanInto(existing, plan);
         merged = true;
         break;
