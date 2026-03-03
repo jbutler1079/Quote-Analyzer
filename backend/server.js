@@ -98,7 +98,7 @@ function extractPlanFromText(text, sourceFile) {
   // Detect network type occurrences to split into plan blocks if multiple
   const networkPattern = /\b(HMO|PPO|EPO|HDHP|HSA)\b/gi;
   const planNamePattern =
-    /(?:plan\s*name\s*[:\-]?\s*)([^\n]{3,60})|([A-Z][A-Za-z0-9 \-\/]*(HMO|PPO|EPO|HDHP|HDHP)[A-Za-z0-9 \-\/]*)/gi;
+    /(?:plan\s*name\s*[:\-]?\s*)([^\n]{3,60})|([A-Z][A-Za-z0-9 \-\/]*(HMO|PPO|EPO|HDHP|HSA)[A-Za-z0-9 \-\/]*)/gi;
 
   // ── Attempt to find multiple plan blocks separated by plan names ──
   const planBlocks = splitIntoPlanBlocks(lines, fullText);
