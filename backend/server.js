@@ -2727,7 +2727,7 @@ app.post('/recommend', (req, res) => {
 // ── Export PPTX ───────────────────────────────────────────────────────────────
 app.post('/export/pptx', async (req, res) => {
   try {
-    const { caseId, clientName = 'Client', effectiveDate = '', contribution } = req.body;
+    const { caseId, clientName = 'Client', effectiveDate = '', contribution, selectedPlanIndices } = req.body;
     if (!caseId) return res.status(400).json({ error: 'caseId is required' });
     const caseData = caseStore.get(caseId);
     if (!caseData) return res.status(404).json({ error: 'Case not found' });
@@ -2736,19 +2736,49 @@ app.post('/export/pptx', async (req, res) => {
     const recData = caseData.recommendations || {};
     const contributionConfig = normalizeContributionConfig(contribution || recData.contribution || caseData.contribution || defaultContributionConfig());
     caseData.contribution = contributionConfig;
-    const recommendations = (recData.recommendations || plans.slice(0, 3).map((p, i) => ({ rank: i + 1, ...p }))).map(plan => {
-      if (typeof plan.employerPerPayCost === 'number' && typeof plan.employeePerPayCost === 'number') return plan;
-      const shares = calculatePlanCostShares(plan, caseData.census || {}, contributionConfig);
-      return {
-        ...plan,
-        employerMonthlyCost: Math.round(shares.employerMonthlyTotal * 100) / 100,
-        employeeMonthlyCost: Math.round(shares.employeeMonthlyTotal * 100) / 100,
-        employerPerPayCost: Math.round(shares.employerPerPayTotal * 100) / 100,
-        employeePerPayCost: Math.round(shares.employeePerPayTotal * 100) / 100,
-        payrollFrequency: shares.payrollFrequency,
-        contributionBreakdown: shares.byTier,
-      };
-    });
+
+    // If account manager selected specific plans, use those; otherwise fall back to recommendations
+    const useManualSelection = Array.isArray(selectedPlanIndices) && selectedPlanIndices.length > 0;
+    let exportPlans;
+    if (useManualSelection) {
+      exportPlans = selectedPlanIndices
+        .filter(i => i >= 0 && i < plans.length)
+        .slice(0, 5)
+        .map((idx, rank) => {
+          const plan = plans[idx];
+          const shares = calculatePlanCostShares(plan, caseData.census || {}, contributionConfig);
+          return {
+            ...plan,
+            rank: rank + 1,
+            recommendationLabel: `Selected Plan ${rank + 1}`,
+            employerMonthlyCost: Math.round(shares.employerMonthlyTotal * 100) / 100,
+            employeeMonthlyCost: Math.round(shares.employeeMonthlyTotal * 100) / 100,
+            employerPerPayCost: Math.round(shares.employerPerPayTotal * 100) / 100,
+            employeePerPayCost: Math.round(shares.employeePerPayTotal * 100) / 100,
+            monthlyTotalCost: Math.round((shares.employerMonthlyTotal + shares.employeeMonthlyTotal) * 100) / 100,
+            payrollFrequency: shares.payrollFrequency,
+            contributionBreakdown: shares.byTier,
+          };
+        });
+      console.log(`[PPTX] Using ${exportPlans.length} manually selected plans`);
+    } else {
+      exportPlans = (recData.recommendations || plans.slice(0, 3).map((p, i) => ({ rank: i + 1, ...p }))).map(plan => {
+        if (typeof plan.employerPerPayCost === 'number' && typeof plan.employeePerPayCost === 'number') return plan;
+        const shares = calculatePlanCostShares(plan, caseData.census || {}, contributionConfig);
+        return {
+          ...plan,
+          employerMonthlyCost: Math.round(shares.employerMonthlyTotal * 100) / 100,
+          employeeMonthlyCost: Math.round(shares.employeeMonthlyTotal * 100) / 100,
+          employerPerPayCost: Math.round(shares.employerPerPayTotal * 100) / 100,
+          employeePerPayCost: Math.round(shares.employeePerPayTotal * 100) / 100,
+          monthlyTotalCost: plan.monthlyTotalCost || Math.round((shares.employerMonthlyTotal + shares.employeeMonthlyTotal) * 100) / 100,
+          payrollFrequency: shares.payrollFrequency,
+          contributionBreakdown: shares.byTier,
+        };
+      });
+      console.log(`[PPTX] Using ${exportPlans.length} recommended plans`);
+    }
+    const recommendations = exportPlans;
     const census = caseData.census || {};
 
     const pptx = new PptxGenJS();
@@ -2855,13 +2885,15 @@ app.post('/export/pptx', async (req, res) => {
     });
     addFooter(s2);
 
-    // ── Slides 3-5: Top Recommendations ──
-    const rankLabels = ['Top Pick', 'Runner-Up', 'Strong Alternative'];
-    const rankColors = [GOLD, SILVER, BRONZE];
+    // ── Individual Plan Slides ──
+    const rankLabels = useManualSelection
+      ? recommendations.map((_, i) => `Selected Plan ${i + 1}`)
+      : ['Top Pick', 'Runner-Up', 'Strong Alternative', 'Alternative #4', 'Alternative #5'];
+    const rankColors = [GOLD, SILVER, BRONZE, ACCENT, MUTED];
     const tierLabels = { ee: 'EE Only', es: 'EE + Spouse', ec: 'EE + Child(ren)', ef: 'Family' };
     const payPeriodsMap = PAY_PERIODS_PER_MONTH[contributionConfig.payrollFrequency] || PAY_PERIODS_PER_MONTH.biweekly;
 
-    recommendations.slice(0, 3).forEach((plan, idx) => {
+    recommendations.forEach((plan, idx) => {
       const s = pptx.addSlide();
       const label = plan.recommendationLabel || rankLabels[idx] || `Recommendation #${idx + 1}`;
       const isLowest = label === 'Lowest Cost Option';
@@ -2964,11 +2996,12 @@ app.post('/export/pptx', async (req, res) => {
       addFooter(s);
     });
 
-    // ── Slide 6: Side-by-Side Comparison ──
+    // ── Comparison Slide: Side-by-Side ──
     const s6 = pptx.addSlide();
-    const compPlans = recommendations.slice(0, 3);
+    const compPlans = recommendations;
+    const numPlans = compPlans.length;
     const compLabels = compPlans.map((p, i) => p.recommendationLabel || rankLabels[i] || `#${i + 1}`);
-    addSlideHeader(s6, 'Plan Comparison', `Side-by-side view of ${compPlans.length} recommended plans`);
+    addSlideHeader(s6, 'Plan Comparison', `Side-by-side view of ${numPlans} ${useManualSelection ? 'selected' : 'recommended'} plans`);
 
     const rowLabels = [
       'Carrier', 'Network', 'Metal Level', 'Deductible (Ind)', 'OOP Max (Ind)',
@@ -2993,19 +3026,23 @@ app.post('/export/pptx', async (req, res) => {
       }
     };
 
-    const colW = 2.5;
-    const startX = 0.5;
-    const labelColW = 2.2;
+    // Dynamic column widths based on number of plans (total slide width ~10")
+    const startX = 0.3;
+    const totalTableW = 9.4;
+    const labelColW = numPlans <= 3 ? 2.2 : (numPlans <= 4 ? 1.9 : 1.7);
+    const colW = (totalTableW - labelColW) / numPlans;
+    const compFontSize = numPlans <= 3 ? 9 : (numPlans <= 4 ? 8 : 7);
+    const compNameMaxChars = numPlans <= 3 ? 22 : (numPlans <= 4 ? 18 : 15);
 
     // Header row
     s6.addShape(pptx.ShapeType.rect, { x: startX, y: 1.18, w: labelColW, h: 0.45, fill: { color: PRIMARY } });
-    s6.addText('Benefit', { x: startX, y: 1.21, w: labelColW, h: 0.38, fontSize: 10, bold: true, color: WHITE, align: 'center' });
+    s6.addText('Benefit', { x: startX, y: 1.21, w: labelColW, h: 0.38, fontSize: compFontSize + 1, bold: true, color: WHITE, align: 'center' });
     compPlans.forEach((plan, ci) => {
       const cx = startX + labelColW + ci * colW;
       const badgeColor = (plan.recommendationLabel === 'Lowest Cost Option') ? GREEN : (rankColors[ci] || ACCENT);
       s6.addShape(pptx.ShapeType.rect, { x: cx, y: 1.18, w: colW, h: 0.45, fill: { color: badgeColor } });
-      s6.addText(`${compLabels[ci]}`, { x: cx, y: 1.18, w: colW, h: 0.22, fontSize: 8, bold: true, color: WHITE, align: 'center' });
-      s6.addText(`${(plan.planName || 'Plan').substring(0, 22)}`, { x: cx, y: 1.38, w: colW, h: 0.22, fontSize: 9, color: WHITE, align: 'center' });
+      s6.addText(`${compLabels[ci]}`, { x: cx, y: 1.18, w: colW, h: 0.22, fontSize: compFontSize - 1, bold: true, color: WHITE, align: 'center' });
+      s6.addText(`${(plan.planName || 'Plan').substring(0, compNameMaxChars)}`, { x: cx, y: 1.38, w: colW, h: 0.22, fontSize: compFontSize, color: WHITE, align: 'center' });
     });
 
     rowLabels.forEach((label, ri) => {
@@ -3013,41 +3050,46 @@ app.post('/export/pptx', async (req, res) => {
       const bg = ri % 2 === 0 ? LIGHT : WHITE;
       const isPremiumRow = ri >= 8;
       s6.addShape(pptx.ShapeType.rect, { x: startX, y: yPos, w: labelColW, h: 0.41, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
-      s6.addText(label, { x: startX + 0.08, y: yPos + 0.07, w: labelColW - 0.1, h: 0.28, fontSize: 9, bold: true, color: TEXT_DARK });
+      s6.addText(label, { x: startX + 0.08, y: yPos + 0.07, w: labelColW - 0.1, h: 0.28, fontSize: compFontSize, bold: true, color: TEXT_DARK });
       compPlans.forEach((plan, ci) => {
         const cx = startX + labelColW + ci * colW;
         s6.addShape(pptx.ShapeType.rect, { x: cx, y: yPos, w: colW, h: 0.41, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
-        s6.addText(getVal(plan, label), { x: cx + 0.05, y: yPos + 0.07, w: colW - 0.1, h: 0.28, fontSize: 9, color: isPremiumRow ? ACCENT : TEXT_DARK, bold: isPremiumRow, align: 'center' });
+        s6.addText(getVal(plan, label), { x: cx + 0.05, y: yPos + 0.07, w: colW - 0.1, h: 0.28, fontSize: compFontSize, color: isPremiumRow ? ACCENT : TEXT_DARK, bold: isPremiumRow, align: 'center' });
       });
     });
     addFooter(s6);
 
-    // ── Slide 7: Per-Employee Cost Breakdown ──
-    const s7 = pptx.addSlide();
+    // ── Per-Employee Cost Breakdown Slides ──
+    // Split into pages of 3 plans each to keep them readable
     const payFreqLbl = freqLabel[contributionConfig.payrollFrequency] || 'Bi-Weekly';
-    addSlideHeader(s7, 'Per-Employee Cost Breakdown', `What each employee pays per ${payFreqLbl.toLowerCase()} pay period`);
-
-    // Build contribution rules summary line
     const contribDescParts = COVERAGE_TIERS.map(t => {
       const rule = contributionConfig.tiers[t] || { type: 'percent', value: 0 };
       const lbl = { ee: 'EE', es: 'ES', ec: 'EC', ef: 'EF' }[t];
       return rule.type === 'dollar' ? `${lbl}: $${rule.value}` : `${lbl}: ${rule.value}%`;
     });
-    s7.addText(`Employer Contribution: ${contribDescParts.join('  |  ')}  •  Payroll: ${payFreqLbl}`, {
-      x: 0.5, y: 1.15, w: 9.0, h: 0.3, fontSize: 9, color: MUTED, italic: true,
-    });
+    const contribSummaryText = `Employer Contribution: ${contribDescParts.join('  |  ')}  •  Payroll: ${payFreqLbl}`;
+
+    const plansPerCostPage = 3;
+    for (let pageStart = 0; pageStart < compPlans.length; pageStart += plansPerCostPage) {
+      const pagePlans = compPlans.slice(pageStart, pageStart + plansPerCostPage);
+      const pageNum = Math.floor(pageStart / plansPerCostPage) + 1;
+      const totalPages = Math.ceil(compPlans.length / plansPerCostPage);
+      const pageLabel = totalPages > 1 ? ` (${pageNum}/${totalPages})` : '';
+      const s7 = pptx.addSlide();
+      addSlideHeader(s7, `Per-Employee Cost Breakdown${pageLabel}`, `What each employee pays per ${payFreqLbl.toLowerCase()} pay period`);
+      s7.addText(contribSummaryText, { x: 0.5, y: 1.15, w: 9.0, h: 0.3, fontSize: 9, color: MUTED, italic: true });
 
     const ppColW = 2.1;
     const ppLabelW = 2.8;
     const ppStartX = 0.5;
     const ppTiers = ['ee', 'es', 'ec', 'ef'];
 
-    // One table per recommended plan
-    compPlans.forEach((plan, pi) => {
+    // One table per plan on this page
+    pagePlans.forEach((plan, pi) => {
       const blockY = 1.6 + pi * 2.0;
       const shares = calculatePlanCostShares(plan, census, contributionConfig);
-      const planLabel = plan.recommendationLabel || rankLabels[pi] || `Plan ${pi + 1}`;
-      const badgeColor = (plan.recommendationLabel === 'Lowest Cost Option') ? GREEN : (rankColors[pi] || ACCENT);
+      const planLabel = plan.recommendationLabel || rankLabels[pageStart + pi] || `Plan ${pageStart + pi + 1}`;
+      const badgeColor = (plan.recommendationLabel === 'Lowest Cost Option') ? GREEN : (rankColors[pageStart + pi] || ACCENT);
 
       // Plan label bar
       s7.addShape(pptx.ShapeType.rect, { x: ppStartX, y: blockY, w: 9.0, h: 0.35, fill: { color: badgeColor } });
@@ -3083,21 +3125,29 @@ app.post('/export/pptx', async (req, res) => {
       });
     });
     addFooter(s7);
+    } // end cost breakdown page loop
 
-    // ── Slide 8: Monthly Premium Summary (aggregate) ──
+    // ── Aggregate Monthly Costs Slide ──
     const s8 = pptx.addSlide();
     addSlideHeader(s8, 'Aggregate Monthly Costs', `Total employer and employee costs across all enrolled members`);
 
-    const premColW = 2.2;
-    const premStartX = 0.5;
-    const premHeaders = ['Tier', 'Enrolled', ...compPlans.map((p, i) => (p.recommendationLabel || rankLabels[i] || `Plan ${i+1}`).substring(0, 16))];
+    // Dynamic column widths for aggregate slide
+    const aggTotalW = 9.4;
+    const aggLabelColW = numPlans <= 3 ? 2.2 : (numPlans <= 4 ? 1.8 : 1.5);
+    const aggEnrolledW = numPlans <= 3 ? 1.0 : 0.8;
+    const premColW = (aggTotalW - aggLabelColW - aggEnrolledW) / numPlans;
+    const premStartX = 0.3;
+    const aggFontSize = numPlans <= 3 ? 9 : (numPlans <= 4 ? 8 : 7);
+    const premHeaders = ['Tier', 'Enrolled', ...compPlans.map((p, i) => (p.recommendationLabel || rankLabels[i] || `Plan ${i+1}`).substring(0, numPlans <= 3 ? 16 : 12))];
 
-    // Header
+    // Header — positioned with dynamic widths
+    const aggHeaderWidths = [aggLabelColW, aggEnrolledW, ...compPlans.map(() => premColW)];
+    let aggHdrX = premStartX;
     premHeaders.forEach((hdr, hi) => {
-      const hx = premStartX + hi * premColW;
-      const w = hi === 0 ? premColW : premColW;
-      s8.addShape(pptx.ShapeType.rect, { x: hx, y: 1.2, w, h: 0.45, fill: { color: PRIMARY } });
-      s8.addText(hdr, { x: hx + 0.05, y: 1.24, w: w - 0.1, h: 0.36, fontSize: 9, bold: true, color: WHITE, align: hi === 0 ? 'left' : 'center' });
+      const w = aggHeaderWidths[hi];
+      s8.addShape(pptx.ShapeType.rect, { x: aggHdrX, y: 1.2, w, h: 0.45, fill: { color: PRIMARY } });
+      s8.addText(hdr, { x: aggHdrX + 0.05, y: 1.24, w: w - 0.1, h: 0.36, fontSize: aggFontSize, bold: true, color: WHITE, align: hi === 0 ? 'left' : 'center' });
+      aggHdrX += w;
     });
 
     const tierCensus = { ee: census.ee || 0, es: census.es || 0, ec: census.ec || 0, ef: census.ef || 0 };
@@ -3112,36 +3162,38 @@ app.post('/export/pptx', async (req, res) => {
       const yPos = 1.7 + ri * 0.42;
       const bg = ri % 2 === 0 ? LIGHT : WHITE;
       // Tier label
-      s8.addShape(pptx.ShapeType.rect, { x: premStartX, y: yPos, w: premColW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
-      s8.addText(label, { x: premStartX + 0.08, y: yPos + 0.07, w: premColW - 0.1, h: 0.26, fontSize: 10, bold: true, color: TEXT_DARK });
+      s8.addShape(pptx.ShapeType.rect, { x: premStartX, y: yPos, w: aggLabelColW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+      s8.addText(label, { x: premStartX + 0.08, y: yPos + 0.07, w: aggLabelColW - 0.1, h: 0.26, fontSize: aggFontSize + 1, bold: true, color: TEXT_DARK });
       // Enrolled
-      s8.addShape(pptx.ShapeType.rect, { x: premStartX + premColW, y: yPos, w: premColW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
-      s8.addText(String(tierCensus[key]), { x: premStartX + premColW, y: yPos + 0.07, w: premColW, h: 0.26, fontSize: 10, color: TEXT_DARK, align: 'center' });
+      const enrolledX = premStartX + aggLabelColW;
+      s8.addShape(pptx.ShapeType.rect, { x: enrolledX, y: yPos, w: aggEnrolledW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+      s8.addText(String(tierCensus[key]), { x: enrolledX, y: yPos + 0.07, w: aggEnrolledW, h: 0.26, fontSize: aggFontSize + 1, color: TEXT_DARK, align: 'center' });
       // Plan premiums
       compPlans.forEach((plan, ci) => {
-        const cx = premStartX + (2 + ci) * premColW;
+        const cx = premStartX + aggLabelColW + aggEnrolledW + ci * premColW;
         s8.addShape(pptx.ShapeType.rect, { x: cx, y: yPos, w: premColW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
-        s8.addText(fmtDol(plan[field]), { x: cx, y: yPos + 0.07, w: premColW, h: 0.26, fontSize: 10, bold: true, color: ACCENT, align: 'center' });
+        s8.addText(fmtDol(plan[field]), { x: cx, y: yPos + 0.07, w: premColW, h: 0.26, fontSize: aggFontSize, bold: true, color: ACCENT, align: 'center' });
       });
     });
 
     // Totals section
     const totY = 1.7 + 4 * 0.42 + 0.15;
+    const totLabelW = aggLabelColW + aggEnrolledW;
     const totalRowLabels = ['Est. Monthly Total', `Employer / ${payFreqLbl}`, `Employee / ${payFreqLbl}`];
     const totalRowColors = [TEXT_DARK, PRIMARY, ORANGE];
     totalRowLabels.forEach((lbl, ri) => {
       const yPos = totY + ri * 0.42;
-      s8.addShape(pptx.ShapeType.rect, { x: premStartX, y: yPos, w: premColW * 2, h: 0.4, fill: { color: ri === 0 ? PRIMARY : 'e8f4fd' }, line: { color: 'e8e8e8', width: 0.3 } });
-      s8.addText(lbl, { x: premStartX + 0.08, y: yPos + 0.07, w: premColW * 2 - 0.1, h: 0.26, fontSize: 10, bold: true, color: ri === 0 ? WHITE : totalRowColors[ri] });
+      s8.addShape(pptx.ShapeType.rect, { x: premStartX, y: yPos, w: totLabelW, h: 0.4, fill: { color: ri === 0 ? PRIMARY : 'e8f4fd' }, line: { color: 'e8e8e8', width: 0.3 } });
+      s8.addText(lbl, { x: premStartX + 0.08, y: yPos + 0.07, w: totLabelW - 0.1, h: 0.26, fontSize: aggFontSize + 1, bold: true, color: ri === 0 ? WHITE : totalRowColors[ri] });
       compPlans.forEach((plan, ci) => {
-        const cx = premStartX + (2 + ci) * premColW;
+        const cx = premStartX + totLabelW + ci * premColW;
         let val;
         if (ri === 0) val = fmtDol(plan.monthlyTotalCost);
         else if (ri === 1) val = fmtDol(plan.employerPerPayCost);
         else val = fmtDol(plan.employeePerPayCost);
         const bg = ri === 0 ? PRIMARY : 'e8f4fd';
         s8.addShape(pptx.ShapeType.rect, { x: cx, y: yPos, w: premColW, h: 0.4, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
-        s8.addText(val, { x: cx, y: yPos + 0.07, w: premColW, h: 0.26, fontSize: 10, bold: true, color: ri === 0 ? WHITE : totalRowColors[ri], align: 'center' });
+        s8.addText(val, { x: cx, y: yPos + 0.07, w: premColW, h: 0.26, fontSize: aggFontSize, bold: true, color: ri === 0 ? WHITE : totalRowColors[ri], align: 'center' });
       });
     });
     addFooter(s8);
