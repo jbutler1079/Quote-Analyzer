@@ -440,6 +440,16 @@ function extractPlanFromText(text, sourceFile) {
     }
   } catch (e) { console.log(`[EXTRACT] Strategy 8 error: ${e.message}`); }
 
+  // ── Strategy 9: BCBS Proposal Grid ──────────────────────────────────────
+  try {
+    const bcbsPlans = extractFromBCBSGrid(text, sourceFile);
+    if (bcbsPlans.length > 0) {
+      const score = scoreStrategyResult(bcbsPlans);
+      console.log(`[EXTRACT] Strategy 9 (BCBS grid): ${bcbsPlans.length} plans, score=${score}`);
+      candidates.push({ name: 'BCBS proposal grid', plans: bcbsPlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 9 error: ${e.message}`); }
+
   // ── Pick the best strategy by quality score ─────────────────────────────
   let plans = [];
   if (candidates.length > 0) {
@@ -971,6 +981,261 @@ function extractFromAetnaCostGrid(text, sourceFile) {
   }
 
   console.log(`[AETNA GRID] Extracted ${plans.length} plans from Aetna cost grid`);
+  return plans;
+}
+
+// ── Strategy 9: BCBS Proposal Grid ────────────────────────────────────────────
+// Handles Blue Cross Blue Shield "Illustrative Composite Billed Rates" PDFs.
+// Grid section layout per plan block:
+//   PLAN_ID (e.g. P9M1CHC, G654CHC)   ← plan code
+//   [*N footnotes]                     ← optional
+//   $DED_IN//                          ← deductible in-network
+//   $DED_OUT or "Not Covered"          ← deductible out-of-network
+//   $OOP_IN//                          ← OOP max in-network
+//   $OOP_OUT or "Unlimited"/"Not Covered"
+//   COINS_IN%//                        ← coinsurance in-network
+//   COINS_OUT%                         ← coinsurance out-of-network
+//   $PCP/$VIRT$SPEC                    ← PCP/Virtual, Specialist copay  (or DC/DC DC)
+//   $ER//                              ← ER copay
+//   COINS%                             ← ER coinsurance
+//   $UC                                ← urgent care copay
+//   InPat ded lines (skip)
+//   OutPat ded lines (skip)
+//   Rx tiers: $T1/$T2/$T3/$T4/$T5/$T6  ← or "100%" or "X%/X%/X%..."
+//   $EO$ES$EC$EF$TOTAL                 ← premiums concatenated on one line
+function extractFromBCBSGrid(text, sourceFile) {
+  // Gate: must look like a BCBS proposal grid
+  if (!/Illustrative\s*Composite|Blue\s*Choice\s*PPO|Blue\s*Advantage\s*HMO/i.test(text)) return [];
+
+  const plans = [];
+  const lines = text.split('\n');
+  const carrier = 'BCBS';
+
+  // Track current context as we scan
+  let currentNetwork = null;  // 'PPO' or 'HMO'
+  let currentMetal = null;    // 'Platinum', 'Gold', 'Silver', 'Bronze'
+  let isHSA = false;
+
+  // Extract effective date from header
+  const effMatch = text.match(/Effective\s*Date:\s*(\d{2}\/\d{2}\/\d{4})/i);
+  const effectiveDate = effMatch ? effMatch[1] : null;
+
+  // BCBS plan IDs: letter + alphanumeric + 3-letter suffix (e.g. P9M1CHC, G654CHC, S663CHC, B662CHC, P9M1ADT)
+  const PLAN_ID_RE = /^([A-Z]\w{2,8}(?:CHC|ADT|ADV|HMO|PPO))$/;
+  // Footnote line
+  const FOOTNOTE_RE = /^(\*\d+)+$/;
+  // Deductible/OOP line: "$X//" pattern
+  const DOLLAR_SLASH_RE = /^\$(\d[\d,]*)\s*\/\/$/;
+  // OOP/Ded out-of-network value
+  const OON_VALUE_RE = /^(?:\$(\d[\d,]*)|Unlimited|Not\s*Covered)$/;
+  // Coinsurance line: "X%//"
+  const COINS_IN_RE = /^(\d+)%\s*\/\/$/;
+  // Coinsurance out: "X%" or "Not Covered"
+  const COINS_OUT_RE = /^(?:(\d+)%|Not\s*Covered)$/;
+  // Premium line: multiple $X,XXX.XX concatenated
+  const PREMIUM_LINE_RE = /^(\$[\d,]+\.\d{2}){3,5}$/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+
+    // Track network context
+    if (/Blue\s*Choice\s*PPO/i.test(line)) { currentNetwork = 'PPO'; continue; }
+    if (/Blue\s*Advantage\s*HMO/i.test(line)) { currentNetwork = 'HMO'; continue; }
+
+    // Track metal level context
+    if (/^Platinum$/i.test(line)) { currentMetal = 'Platinum'; continue; }
+    if (/^Gold$/i.test(line)) { currentMetal = 'Gold'; continue; }
+    if (/^Silver$/i.test(line)) { currentMetal = 'Silver'; continue; }
+    if (/^Bronze$/i.test(line)) { currentMetal = 'Bronze'; continue; }
+    if (/^Expanded\s*Bronze$/i.test(line)) { currentMetal = 'Bronze'; continue; }
+    if (/^HSA\s*Plans$/i.test(line)) { isHSA = true; continue; }
+    if (/^(?:PPO|HMO)\s*Plans$/i.test(line)) { isHSA = false; continue; }
+
+    // Skip header/footer lines
+    if (/^Plan\s*ID$/i.test(line)) continue;
+    if (/^(?:Individual|Coinsurance|Primary|ER|Urgent|In-Patient|Out-Patient|Non-|EOESECEF|Total|Monthly|Medical|Cost|Ded|Network|Preferred|Pharmacy)/i.test(line)) continue;
+    if (/^Go\s*to\s*Proposal/i.test(line)) continue;
+    if (/^Blue\s*Cross\s*and/i.test(line)) continue;
+    if (/^Quote\s*ID:/i.test(line)) continue;
+    if (/^No\.\s*of\s*Employees/i.test(line)) continue;
+    if (/^Printed:/i.test(line)) continue;
+    if (/^\*\d/.test(line)) continue;
+
+    // Match plan ID
+    const planIdMatch = line.match(PLAN_ID_RE);
+    if (!planIdMatch) continue;
+
+    const planCode = planIdMatch[1];
+    let nextIdx = i + 1;
+
+    // Skip optional footnote markers
+    if (nextIdx < lines.length && FOOTNOTE_RE.test(lines[nextIdx].trim())) nextIdx++;
+
+    // Helper to read next non-empty line
+    function nextLine() {
+      while (nextIdx < lines.length) {
+        const l = lines[nextIdx].trim();
+        nextIdx++;
+        if (l.length > 0) return l;
+      }
+      return '';
+    }
+
+    // Parse deductible in-network: "$X//"
+    let l = nextLine();
+    let dedInMatch = l.match(/^\$(\d[\d,]*)\s*\/\//);
+    if (!dedInMatch) continue;
+    const deductibleIndividual = parseMoney(dedInMatch[1]);
+
+    // Deductible out-of-network
+    l = nextLine();
+    // Could be "$5000", "Not Covered", or another value
+
+    // OOP max in-network: "$X//"
+    l = nextLine();
+    let oopInMatch = l.match(/^\$(\d[\d,]*)\s*\/\//);
+    const oopMaxIndividual = oopInMatch ? parseMoney(oopInMatch[1]) : null;
+
+    // OOP max out-of-network
+    l = nextLine();
+
+    // Coinsurance in-network: "X%//"
+    l = nextLine();
+    let coinsInMatch = l.match(/^(\d+)%\s*\/\//);
+    const coinsurance = coinsInMatch ? `${coinsInMatch[1]}%` : null;
+
+    // Coinsurance out-of-network
+    l = nextLine();
+
+    // PCP/Virtual + Specialist copay: "$PCP/$VIRT$SPEC" or "DC/DC DC" or "$PCP/$VIRT DC"
+    l = nextLine();
+    let copayPCP = null;
+    let copaySpecialist = null;
+    // Patterns: "$20/$20$40", "DC/DCDC", "$0/$0$40"
+    const pcpMatch = l.match(/^\$(\d+)\/\$?(\d+)\$?(\d+)/);
+    if (pcpMatch) {
+      copayPCP = parseInt(pcpMatch[1], 10);
+      copaySpecialist = parseInt(pcpMatch[3], 10);
+    } else {
+      const dcMatch = l.match(/^DC\/DC\$?(\d+)/);
+      if (dcMatch) {
+        copaySpecialist = parseInt(dcMatch[1], 10);
+      }
+      // If fully "DC/DCDC" — all null, which is fine
+    }
+
+    // ER copay: "$X//" or "DC//"
+    l = nextLine();
+    let copayER = null;
+    const erMatch = l.match(/^\$(\d+)\s*\/\//);
+    if (erMatch) copayER = parseInt(erMatch[1], 10);
+
+    // ER coinsurance: skip
+    l = nextLine();
+
+    // Urgent care: "$X" or "DC"
+    l = nextLine();
+    let copayUrgentCare = null;
+    const ucMatch = l.match(/^\$(\d+)$/);
+    if (ucMatch) copayUrgentCare = parseInt(ucMatch[1], 10);
+
+    // In-patient deductible in/out: 2 lines
+    l = nextLine(); // e.g. "DC//" or "$150//"
+    l = nextLine(); // e.g. "DC" or "Not Covered"
+
+    // Out-patient deductible in/out: 2 lines
+    l = nextLine(); // e.g. "DC//" or "$100//"
+    l = nextLine(); // e.g. "DC" or "$200"
+
+    // Rx tiers: "$T1/$T2/$T3/" (may wrap) or "100%" or "X%/X%/X%..."
+    // NOTE: Sometimes "100%" or "X%..." is concatenated with premiums on same line,
+    // e.g. "100%$982.85$1,965.70$1,965.70$2,948.55$16,708.45"
+    l = nextLine();
+    let rxTier1 = null, rxTier2 = null, rxTier3 = null;
+    let premiumLineOverride = null;  // If premiums are on the Rx line
+    // Match dollar-based Rx: "$10/$20/$70/" or "$10/$20/$55/"
+    let rxMatch = l.match(/^\$(\d+)\/\$(\d+)\/\$(\d+)/);
+    if (rxMatch) {
+      rxTier1 = parseInt(rxMatch[1], 10);
+      rxTier2 = parseInt(rxMatch[2], 10);
+      rxTier3 = parseInt(rxMatch[3], 10);
+      // Next line has more Rx tiers (e.g. "$120/$150/$250") — skip
+      l = nextLine();
+    } else if (/^\d+%.*\$[\d,]+\.\d{2}/.test(l)) {
+      // Percentage Rx concatenated with premiums: "100%$982.85..." or "80%/80%/...$1,234.56..."
+      premiumLineOverride = l;
+    } else if (/^\d+%/.test(l)) {
+      // Percentage-based Rx like "80%/80%/70%/60%/60%/50%"
+      // Can't map to dollar copays — leave as null
+      // But check for continuation
+      if (l.endsWith('/')) l = nextLine();
+    } else if (/^100%$/.test(l)) {
+      // 100% coverage — no Rx copays — premiums on next line
+    }
+
+    // Premium line: "$EO$ES$EC$EF$TOTAL" all concatenated
+    l = premiumLineOverride || nextLine();
+    // Match: $1,638.23$3,276.46$3,276.46$4,914.69$27,849.91
+    const premiums = [];
+    const premRe = /\$(\d[\d,]*\.\d{2})/g;
+    let pm;
+    while ((pm = premRe.exec(l)) !== null) {
+      premiums.push(parseMoney(pm[1]));
+    }
+
+    const premiumEE = premiums[0] || null;
+    const premiumES = premiums[1] || null;
+    const premiumEC = premiums[2] || null;
+    const premiumEF = premiums[3] || null;
+
+    // Determine network type
+    let networkType = isHSA ? 'HSA' : currentNetwork;
+
+    // Build plan name from context + plan code
+    const metalStr = currentMetal || '';
+    const networkStr = currentNetwork === 'HMO' ? 'Blue Advantage HMO' : 'Blue Choice PPO';
+    const planName = `${networkStr} ${metalStr} ${planCode}`.replace(/\s+/g, ' ').trim();
+
+    // Score confidence
+    const fields = [deductibleIndividual, oopMaxIndividual, coinsurance,
+                    copayPCP, copaySpecialist, copayER, copayUrgentCare,
+                    premiumEE, premiumES, premiumEC, premiumEF,
+                    rxTier1].filter(v => v != null);
+    const confidence = Math.min(1, 0.5 + (fields.length * 0.05));
+
+    plans.push({
+      id: uuidv4(),
+      carrier,
+      planName,
+      planCode,
+      networkType,
+      metalLevel: currentMetal,
+      deductibleIndividual,
+      deductibleFamily: null,
+      oopMaxIndividual,
+      oopMaxFamily: null,
+      coinsurance,
+      copayPCP: copayPCP === 0 ? null : copayPCP,
+      copaySpecialist: copaySpecialist === 0 ? null : copaySpecialist,
+      copayUrgentCare,
+      copayER,
+      rxDeductible: null,
+      rxTier1,
+      rxTier2,
+      rxTier3,
+      premiumEE,
+      premiumES,
+      premiumEC,
+      premiumEF,
+      effectiveDate,
+      ratingArea: null,
+      underwritingNotes: null,
+      extractionConfidence: confidence,
+      sourceFile,
+    });
+  }
+
+  console.log(`[BCBS GRID] Extracted ${plans.length} plans from BCBS proposal grid`);
   return plans;
 }
 
