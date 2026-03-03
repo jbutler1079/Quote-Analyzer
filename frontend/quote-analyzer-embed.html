@@ -8,6 +8,14 @@
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 
 <style>
+/* ── Break out of narrow WP theme container ────────────────────────────── */
+#qa-app {
+  width: 100vw;
+  margin-left: calc(-50vw + 50%);
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
 /* ── Scope everything under #qa-app to prevent WP theme conflicts ──────── */
 #qa-app {
   all: initial;
@@ -922,26 +930,49 @@
   var FREQ_LABEL = { weekly: 'Weekly', biweekly: 'Bi-Weekly', semimonthly: 'Semi-Monthly', monthly: 'Monthly' };
 
   /* ── Configuration ───────────────────────────────────────────────────── */
-  // When served from the same server (port 3001), leave as '' (same origin).
-  // For WordPress embed, set to your deployed backend URL e.g. 'https://your-api.example.com'
-  var API_BASE = '';
+  // Deployed backend URL. Override via window.QUOTE_ANALYZER_API_BASE if needed.
+  var API_BASE = resolveApiBase() || 'https://quote-analyzer-api.onrender.com';
+
+  function resolveApiBase() {
+    var fromGlobal = (window.QUOTE_ANALYZER_API_BASE || (window.qaConfig && window.qaConfig.apiBase) || '');
+    var fromQuery = (new URLSearchParams(window.location.search).get('apiBase') || '');
+    return String(fromGlobal || fromQuery || '').trim().replace(/\/+$/, '');
+  }
 
   /* ── API helpers ──────────────────────────────────────────────────────── */
   function getApiBase() { return API_BASE; }
 
   async function apiPost(path, body) {
     var resp = await fetch(getApiBase() + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (!resp.ok) { var err = await resp.json().catch(function() { return { error: resp.statusText }; }); throw new Error(err.error || 'HTTP ' + resp.status); }
+    if (!resp.ok) {
+      if (resp.status === 404 && !getApiBase()) {
+        throw new Error('HTTP 404 (API endpoint not found). In WordPress, set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
+      }
+      var err = await resp.json().catch(function() { return { error: resp.statusText }; });
+      throw new Error(err.error || 'HTTP ' + resp.status);
+    }
     return resp.json();
   }
   async function apiPostForm(path, formData) {
     var resp = await fetch(getApiBase() + path, { method: 'POST', body: formData });
-    if (!resp.ok) { var err = await resp.json().catch(function() { return { error: resp.statusText }; }); throw new Error(err.error || 'HTTP ' + resp.status); }
+    if (!resp.ok) {
+      if (resp.status === 404 && !getApiBase()) {
+        throw new Error('HTTP 404 (API endpoint not found). In WordPress, set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
+      }
+      var err = await resp.json().catch(function() { return { error: resp.statusText }; });
+      throw new Error(err.error || 'HTTP ' + resp.status);
+    }
     return resp.json();
   }
   async function apiPostBlob(path, body) {
     var resp = await fetch(getApiBase() + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    if (!resp.ok) { var err = await resp.json().catch(function() { return { error: resp.statusText }; }); throw new Error(err.error || 'HTTP ' + resp.status); }
+    if (!resp.ok) {
+      if (resp.status === 404 && !getApiBase()) {
+        throw new Error('HTTP 404 (API endpoint not found). In WordPress, set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
+      }
+      var err = await resp.json().catch(function() { return { error: resp.statusText }; });
+      throw new Error(err.error || 'HTTP ' + resp.status);
+    }
     var blob = await resp.blob();
     var cd = resp.headers.get('content-disposition') || '';
     var match = cd.match(/filename="?([^"]+)"?/);

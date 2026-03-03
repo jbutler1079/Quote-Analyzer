@@ -28,9 +28,21 @@ const PAY_PERIODS_PER_MONTH = {
 };
 
 /* ── Configuration ───────────────────────────────────────────────────────── */
-// When served from the same server (port 3001), leave as '' (same origin).
-// For external embed, set to your deployed backend URL e.g. 'https://your-api.example.com'
-const API_BASE = '';
+// Deployed backend URL. Override via window.QUOTE_ANALYZER_API_BASE if needed.
+// When served from the same server (port 3001), leave as '' to use same origin.
+const API_BASE = resolveApiBase() || 'https://quote-analyzer-api.onrender.com';
+
+function resolveApiBase() {
+  const fromGlobal =
+    (typeof window !== 'undefined' && window.QUOTE_ANALYZER_API_BASE)
+    || (typeof window !== 'undefined' && window.qaConfig && window.qaConfig.apiBase)
+    || '';
+  const fromQuery = typeof window !== 'undefined'
+    ? new URLSearchParams(window.location.search).get('apiBase')
+    : '';
+  const rawBase = String(fromGlobal || fromQuery || '').trim();
+  return rawBase.replace(/\/+$/, '');
+}
 
 /* ── API helpers ──────────────────────────────────────────────────────────── */
 function getApiBase() { return API_BASE; }
@@ -42,6 +54,9 @@ async function apiPost(path, body) {
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
+    if (resp.status === 404 && !getApiBase()) {
+      throw new Error('HTTP 404 (API endpoint not found). This page is likely embedded on a different host. Set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
+    }
     const err = await resp.json().catch(() => ({ error: resp.statusText }));
     throw new Error(err.error || `HTTP ${resp.status}`);
   }
@@ -54,6 +69,9 @@ async function apiPostForm(path, formData) {
     body: formData,
   });
   if (!resp.ok) {
+    if (resp.status === 404 && !getApiBase()) {
+      throw new Error('HTTP 404 (API endpoint not found). This page is likely embedded on a different host. Set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
+    }
     const err = await resp.json().catch(() => ({ error: resp.statusText }));
     throw new Error(err.error || `HTTP ${resp.status}`);
   }
@@ -67,6 +85,9 @@ async function apiPostBlob(path, body) {
     body: JSON.stringify(body),
   });
   if (!resp.ok) {
+    if (resp.status === 404 && !getApiBase()) {
+      throw new Error('HTTP 404 (API endpoint not found). This page is likely embedded on a different host. Set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
+    }
     const err = await resp.json().catch(() => ({ error: resp.statusText }));
     throw new Error(err.error || `HTTP ${resp.status}`);
   }
