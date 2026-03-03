@@ -430,6 +430,16 @@ function extractPlanFromText(text, sourceFile) {
     }
   } catch (e) { console.log(`[EXTRACT] Strategy 7 error: ${e.message}`); }
 
+  // ── Strategy 8: Aetna Medical Cost Grid ─────────────────────────────────
+  try {
+    const aetnaPlans = extractFromAetnaCostGrid(text, sourceFile);
+    if (aetnaPlans.length > 0) {
+      const score = scoreStrategyResult(aetnaPlans);
+      console.log(`[EXTRACT] Strategy 8 (Aetna cost grid): ${aetnaPlans.length} plans, score=${score}`);
+      candidates.push({ name: 'Aetna cost grid', plans: aetnaPlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 8 error: ${e.message}`); }
+
   // ── Pick the best strategy by quality score ─────────────────────────────
   let plans = [];
   if (candidates.length > 0) {
@@ -770,6 +780,197 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
 
   if (plans.length < 3) return [];
   console.log(`[EXTRACT] Plan code rows: found ${plans.length} plans from code-prefixed lines`);
+  return plans;
+}
+
+// ── Strategy 8: Aetna Medical Cost Grid ───────────────────────────────────────
+// Handles Aetna "Medical Cost Grid - Single Options" PDFs where each plan block
+// looks like:
+//   AFA OAAS 9100 100%Value CY V25          ← plan name (may wrap to next line)
+//   ID: 30021412                             ← plan ID
+//   $9100,100/0,0/0                          ← $ded,planCoins/memberCoins,pcp/spec
+//   0%Med Ded Applies                        ← Rx info OR 3/10/50/80/20%up to...
+//   OAAS$519.93                              ← network + EE premium
+//   (3)                                      ← EE enrolled count
+//   $1,307.56                                ← ES premium
+//   (0)                                      ← ES enrolled
+//   $1,042.59                                ← EC premium
+//   (0)                                      ← EC enrolled
+//   $1,797.05                                ← EF premium
+//   (2)                                      ← EF enrolled
+//   $5,153.89                                ← total premium
+//   (5)                                      ← total enrolled
+//   $1,468.20$3,151.20$486.23$48.26          ← agg, stoploss, admin, TRO
+function extractFromAetnaCostGrid(text, sourceFile) {
+  // Quick gate: must look like an Aetna cost grid
+  if (!/Medical\s*Cost\s*Grid|AFA\s+(OAAS|CPOS)/i.test(text)) return [];
+
+  const plans = [];
+  const lines = text.split('\n');
+
+  // Detect carrier from text/filename
+  const carrier = detectCarrier(text, sourceFile) || 'Aetna';
+
+  // Network map for Aetna plan codes
+  const AETNA_NETWORKS = {
+    'OAAS': 'OA',    // Open Access Aetna Select
+    'CPOS II': 'CPOS',
+    'CPOS': 'CPOS',
+  };
+
+  // Scan lines for plan blocks.  An Aetna plan block starts with a line
+  // beginning with "AFA " and is followed by an ID line, benefit line, etc.
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+
+    // Match plan name line: starts with "AFA "
+    if (!/^AFA\s+/i.test(line)) continue;
+
+    // Collect the full plan name (may wrap to the next line)
+    let planName = line;
+    let nextIdx = i + 1;
+
+    // Check if next line is a continuation (starts with V25, V24, etc. or other
+    // short continuation that doesn't start with ID: or $)
+    if (nextIdx < lines.length) {
+      const nextLine = lines[nextIdx].trim();
+      if (/^V\d{2}\b/.test(nextLine) && nextLine.length < 15) {
+        planName += ' ' + nextLine;
+        nextIdx++;
+      }
+    }
+
+    // Next must be "ID: NNNNNN"
+    if (nextIdx >= lines.length) continue;
+    const idLine = lines[nextIdx].trim();
+    const idMatch = idLine.match(/^ID:\s*(\d+)/);
+    if (!idMatch) continue;
+    const planCode = idMatch[1];
+    nextIdx++;
+
+    // Next: benefit data line "$DED,COINS_PLAN/COINS_MEMBER,PCP/SPEC"
+    if (nextIdx >= lines.length) continue;
+    const benefitLine = lines[nextIdx].trim();
+    const benefitMatch = benefitLine.match(/^\$([\d,]+),(\d+)\/(\d+),(\d+)\/(\d+)/);
+    if (!benefitMatch) continue;
+    nextIdx++;
+
+    const deductibleIndividual = parseMoney(benefitMatch[1]);
+    const coinsurancePlan = parseInt(benefitMatch[2], 10);
+    const coinsuranceMember = parseInt(benefitMatch[3], 10);
+    const copayPCP = parseInt(benefitMatch[4], 10) || null;
+    const copaySpecialist = parseInt(benefitMatch[5], 10) || null;
+    const coinsurance = coinsuranceMember > 0 ? `${coinsuranceMember}%` : null;
+
+    // If copayPCP is 0 and coinsuranceMember is 0, it's likely "0% after ded"
+    // (no copay — deductible applies to everything)
+    const effectivePCP = copayPCP === 0 ? null : copayPCP;
+    const effectiveSpec = copaySpecialist === 0 ? null : copaySpecialist;
+
+    // Next line(s): Rx info — skip past them to find network+premium
+    // Rx lines can be: "0%Med Ded Applies", "0%Med Ded Applies Tiers\n2-5",
+    //                   "3/10/50/80/20%up to\n250/40%up to 500"
+    let rxTier1 = null, rxTier2 = null, rxTier3 = null;
+
+    // Collect Rx lines until we hit a network+premium line
+    let rxText = '';
+    while (nextIdx < lines.length) {
+      const rxLine = lines[nextIdx].trim();
+      // Network+premium line: NETWORK_NAME$AMOUNT e.g. "OAAS$519.93" or "CPOS II$542.85"
+      if (/^(?:OAAS|CPOS\s*II?)\$[\d,]+\.\d{2}$/i.test(rxLine)) break;
+      rxText += ' ' + rxLine;
+      nextIdx++;
+    }
+
+    // Parse Rx tiers from collected Rx text (e.g. "3/10/50/80/20%up to 250/40%up to 500")
+    const rxMatch = rxText.match(/(\d+)\/(\d+)\/(\d+)\/(\d+)/);
+    if (rxMatch) {
+      rxTier1 = parseInt(rxMatch[1], 10);
+      rxTier2 = parseInt(rxMatch[2], 10);
+      rxTier3 = parseInt(rxMatch[3], 10);
+    }
+
+    // Now parse network + EE premium line
+    if (nextIdx >= lines.length) continue;
+    const netPremLine = lines[nextIdx].trim();
+    const netPremMatch = netPremLine.match(/^(OAAS|CPOS\s*II?)\$([\d,]+\.\d{2})$/i);
+    if (!netPremMatch) continue;
+    nextIdx++;
+
+    const networkRaw = netPremMatch[1].trim().toUpperCase();
+    const premiumEE = parseMoney(netPremMatch[2]);
+
+    // Determine network type from plan name
+    let networkType = null;
+    if (/HSA/i.test(planName)) networkType = 'HSA';
+    else if (/CPOS/i.test(networkRaw)) networkType = 'PPO';
+    else if (/OAAS/i.test(networkRaw)) networkType = 'HMO';
+
+    // Next lines: (EE_count), $ES_prem, (ES_count), $EC_prem, (EC_count), $EF_prem, (EF_count)
+    // Parse premium lines — each premium is $AMOUNT followed by (count) on next line
+    function readPremium() {
+      if (nextIdx >= lines.length) return null;
+      // Skip enrollment count lines like "(3)"
+      let l = lines[nextIdx].trim();
+      if (/^\(\d+\)$/.test(l)) { nextIdx++; l = nextIdx < lines.length ? lines[nextIdx].trim() : ''; }
+      const pm = l.match(/^\$([\d,]+\.\d{2})$/);
+      if (pm) { nextIdx++; return parseMoney(pm[1]); }
+      return null;
+    }
+
+    // Skip EE enrolled count
+    if (nextIdx < lines.length && /^\(\d+\)$/.test(lines[nextIdx].trim())) nextIdx++;
+
+    const premiumES = readPremium();
+    const premiumEC = readPremium();
+    const premiumEF = readPremium();
+
+    // Count filled benefit fields for confidence
+    const fields = [deductibleIndividual, coinsurance, effectivePCP, effectiveSpec,
+                    premiumEE, premiumES, premiumEC, premiumEF, rxTier1].filter(v => v != null);
+    const confidence = Math.min(1, 0.5 + (fields.length * 0.06));
+
+    plans.push({
+      id: uuidv4(),
+      carrier,
+      planName: planName.trim(),
+      planCode,
+      networkType,
+      metalLevel: null,  // Aetna cost grids don't use metal levels
+      deductibleIndividual,
+      deductibleFamily: null,
+      oopMaxIndividual: null,  // Not in this grid format
+      oopMaxFamily: null,
+      coinsurance,
+      copayPCP: effectivePCP,
+      copaySpecialist: effectiveSpec,
+      copayUrgentCare: null,
+      copayER: null,
+      rxDeductible: null,
+      rxTier1,
+      rxTier2,
+      rxTier3,
+      premiumEE,
+      premiumES,
+      premiumEC,
+      premiumEF,
+      effectiveDate: null,
+      ratingArea: null,
+      underwritingNotes: null,
+      extractionConfidence: confidence,
+      sourceFile,
+    });
+  }
+
+  // Try to extract effective date from header
+  const effDateMatch = text.match(/Eff\s*Date:\s*(\d{2}\/\d{2}\/\d{2,4})/i);
+  if (effDateMatch && plans.length > 0) {
+    for (const plan of plans) {
+      plan.effectiveDate = effDateMatch[1];
+    }
+  }
+
+  console.log(`[AETNA GRID] Extracted ${plans.length} plans from Aetna cost grid`);
   return plans;
 }
 
