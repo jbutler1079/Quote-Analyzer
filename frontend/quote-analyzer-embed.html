@@ -1,0 +1,1395 @@
+<!--
+  Quote Analyzer — Self-contained WordPress embed
+  Drop this entire block into a WordPress "Custom HTML" block or page builder HTML widget.
+  All CSS & JS are inlined. No external files needed (except Google Fonts CDN).
+  Point the API URL field to your deployed backend (e.g. https://your-server.com).
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+<style>
+/* ── Break out of narrow WP theme container ────────────────────────────── */
+#qa-app {
+  width: 100vw;
+  margin-left: calc(-50vw + 50%);
+  max-width: 100vw;
+  overflow-x: hidden;
+}
+
+/* ── Scope everything under #qa-app to prevent WP theme conflicts ──────── */
+#qa-app {
+  all: initial;
+  display: block;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: #2c3e50;
+  line-height: 1.6;
+  font-size: 16px;
+  background: #f4f6f9;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#qa-app *, #qa-app *::before, #qa-app *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* ── CSS Custom Properties ────────────────────────────────────────────────── */
+#qa-app {
+  --primary:   #1e3a5f;
+  --primary-d: #162d4a;
+  --accent:    #2e86de;
+  --accent-d:  #1a6dbf;
+  --success:   #27ae60;
+  --warning:   #f39c12;
+  --error:     #e74c3c;
+  --bg:        #f4f6f9;
+  --card-bg:   #ffffff;
+  --text:      #2c3e50;
+  --muted:     #7f8c8d;
+  --border:    #dde3ea;
+  --alt-row:   #f8fafc;
+  --radius:    12px;
+  --radius-sm: 8px;
+  --shadow:    0 2px 12px rgba(0,0,0,0.08);
+  --shadow-lg: 0 6px 24px rgba(0,0,0,0.12);
+  --transition: 0.18s ease;
+}
+
+/* ── Container ────────────────────────────────────────────────────────────── */
+#qa-app .qa-container {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 0 28px;
+}
+
+/* ── Header ───────────────────────────────────────────────────────────────── */
+#qa-app .site-header {
+  background: var(--primary);
+  padding: 20px 0;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+#qa-app .header-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+#qa-app .logo-area {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+#qa-app .logo-icon {
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+}
+#qa-app .logo-area h1 {
+  font-size: 1.7rem;
+  font-weight: 700;
+  color: #ffffff;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+#qa-app .tagline {
+  font-size: 0.82rem;
+  color: rgba(255,255,255,0.65);
+  margin-top: 2px;
+  letter-spacing: 0.03em;
+}
+#qa-app .header-badge {
+  background: rgba(255,255,255,0.12);
+  border: 1px solid rgba(255,255,255,0.25);
+  color: rgba(255,255,255,0.8);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 5px 12px;
+  border-radius: 100px;
+}
+
+/* ── Main ─────────────────────────────────────────────────────────────────── */
+#qa-app .qa-main {
+  padding-top: 32px;
+  padding-bottom: 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+/* ── Card ─────────────────────────────────────────────────────────────────── */
+#qa-app .card {
+  background: var(--card-bg);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 28px 32px;
+  transition: box-shadow var(--transition);
+}
+#qa-app .card:hover {
+  box-shadow: var(--shadow-lg);
+}
+#qa-app .card-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--primary);
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border: none;
+  padding: 0;
+}
+#qa-app .step-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: var(--accent);
+  color: white;
+  border-radius: 50%;
+  font-size: 0.8rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+#qa-app .badge-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  height: 24px;
+  padding: 0 8px;
+  background: var(--success);
+  color: white;
+  border-radius: 100px;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+#qa-app .section-hint {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 16px;
+  margin-top: -10px;
+}
+
+/* ── Form Grid ────────────────────────────────────────────────────────────── */
+#qa-app .form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px 24px;
+}
+#qa-app .form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#qa-app .form-group label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.02em;
+}
+#qa-app .optional {
+  font-weight: 400;
+  color: var(--muted);
+}
+#qa-app input[type="text"],
+#qa-app input[type="url"],
+#qa-app input[type="password"],
+#qa-app input[type="number"],
+#qa-app select {
+  width: 100%;
+  padding: 9px 13px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+  font-family: inherit;
+  color: var(--text);
+  background: #fff;
+  transition: border-color var(--transition), box-shadow var(--transition);
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+  line-height: 1.4;
+}
+#qa-app select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%237f8c8d' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  padding-right: 32px;
+}
+#qa-app input:focus,
+#qa-app select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(46,134,222,0.15);
+}
+
+/* ── Drop Zone ────────────────────────────────────────────────────────────── */
+#qa-app .drop-zone {
+  border: 2.5px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 44px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color var(--transition), background var(--transition);
+  user-select: none;
+}
+#qa-app .drop-zone:hover,
+#qa-app .drop-zone:focus,
+#qa-app .drop-zone.drag-over {
+  border-color: var(--accent);
+  background: rgba(46,134,222,0.04);
+  outline: none;
+}
+#qa-app .drop-zone.drag-over {
+  background: rgba(46,134,222,0.08);
+}
+#qa-app .drop-zone-icon {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 14px;
+  color: var(--muted);
+}
+#qa-app .drop-zone-icon svg {
+  width: 100%;
+  height: 100%;
+}
+#qa-app .drop-zone-text {
+  font-size: 1rem;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+#qa-app .link-text {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  transition: text-decoration-color var(--transition);
+}
+#qa-app .drop-zone:hover .link-text {
+  text-decoration-color: var(--accent);
+}
+#qa-app .drop-zone-hint {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+/* ── File List ────────────────────────────────────────────────────────────── */
+#qa-app .file-list {
+  list-style: none;
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+#qa-app .file-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 14px;
+  background: var(--alt-row);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  animation: qaSlideIn 0.18s ease;
+}
+#qa-app .file-item-icon {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: white;
+}
+#qa-app .file-item-icon.pdf  { background: #e74c3c; }
+#qa-app .file-item-icon.xlsx { background: var(--success); }
+#qa-app .file-item-icon.xls  { background: var(--success); }
+#qa-app .file-item-icon.csv  { background: var(--warning); }
+#qa-app .file-item-info { flex: 1; min-width: 0; }
+#qa-app .file-item-name {
+  font-size: 0.88rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  display: block;
+}
+#qa-app .file-item-size {
+  font-size: 0.76rem;
+  color: var(--muted);
+  display: block;
+}
+#qa-app .file-remove {
+  all: unset;
+  cursor: pointer;
+  color: var(--muted);
+  padding: 4px;
+  border-radius: 4px;
+  transition: color var(--transition), background var(--transition);
+  line-height: 1;
+  font-size: 1rem;
+}
+#qa-app .file-remove:hover {
+  color: var(--error);
+  background: rgba(231,76,60,0.1);
+}
+
+/* ── Upload / Recommend Actions ───────────────────────────────────────────── */
+#qa-app .upload-actions,
+#qa-app .recommend-actions {
+  margin-top: 20px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────────── */
+#qa-app .btn {
+  all: unset;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-radius: var(--radius-sm);
+  font-size: 0.9rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: background var(--transition), color var(--transition), border-color var(--transition), transform var(--transition), box-shadow var(--transition);
+  text-decoration: none;
+  white-space: nowrap;
+  box-sizing: border-box;
+  line-height: 1.4;
+}
+#qa-app .btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+#qa-app .btn:active { transform: scale(0.97); }
+#qa-app .btn-primary {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+}
+#qa-app .btn-primary:hover {
+  background: var(--accent-d);
+  border-color: var(--accent-d);
+  box-shadow: 0 4px 12px rgba(46,134,222,0.35);
+}
+#qa-app .btn-accent {
+  background: var(--primary);
+  color: white;
+  border-color: var(--primary);
+}
+#qa-app .btn-accent:hover {
+  background: var(--primary-d);
+  border-color: var(--primary-d);
+  box-shadow: 0 4px 12px rgba(30,58,95,0.35);
+}
+#qa-app .btn-secondary {
+  background: transparent;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+#qa-app .btn-secondary:hover {
+  background: var(--accent);
+  color: white;
+  box-shadow: 0 4px 12px rgba(46,134,222,0.25);
+}
+#qa-app .btn-large { padding: 12px 28px; font-size: 0.95rem; }
+#qa-app .btn-export { padding: 14px 24px; min-width: 220px; font-size: 0.95rem; }
+#qa-app .btn-sub { font-weight: 400; font-size: 0.8rem; opacity: 0.8; }
+#qa-app .btn-icon { width: 18px; height: 18px; flex-shrink: 0; }
+
+/* ── Census ───────────────────────────────────────────────────────────────── */
+#qa-app .census-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+  align-items: flex-end;
+}
+#qa-app .census-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 140px;
+}
+#qa-app .census-group label {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#qa-app .census-label-sub {
+  font-size: 0.74rem;
+  font-weight: 400;
+  color: var(--muted);
+}
+#qa-app .census-input {
+  width: 120px;
+  text-align: center;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+#qa-app .census-total {
+  font-size: 0.88rem;
+  color: var(--muted);
+  padding-bottom: 4px;
+}
+#qa-app .census-total strong {
+  color: var(--accent);
+  font-size: 1.1rem;
+}
+
+/* ── Contribution Setup ───────────────────────────────────────────────────── */
+#qa-app .contribution-top-grid { margin-bottom: 14px; }
+#qa-app .contribution-grid {
+  display: grid;
+  grid-template-columns: minmax(180px,1.1fr) minmax(220px,1fr) minmax(220px,1fr);
+  gap: 10px 12px;
+  align-items: center;
+}
+#qa-app .contribution-header {
+  font-size: 0.76rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 4px 2px;
+}
+#qa-app .contribution-tier-label {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+#qa-app .contribution-tier-label span {
+  font-size: 0.73rem;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+/* ── Plans Table ──────────────────────────────────────────────────────────── */
+#qa-app .table-wrapper {
+  overflow-x: auto;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  max-width: 100%;
+}
+#qa-app .plans-table {
+  width: 100%;
+  min-width: 1100px;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+  table-layout: auto;
+}
+#qa-app .plans-table thead th {
+  background: var(--primary);
+  color: white;
+  font-weight: 600;
+  padding: 10px 8px;
+  text-align: left;
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  user-select: none;
+  font-size: 0.75rem;
+}
+#qa-app .plans-table thead th.sortable { cursor: pointer; transition: background var(--transition); }
+#qa-app .plans-table thead th.sortable:hover { background: var(--primary-d); }
+#qa-app .plans-table thead th.sort-asc .sort-icon::after  { content: ' ▲'; }
+#qa-app .plans-table thead th.sort-desc .sort-icon::after { content: ' ▼'; }
+#qa-app .sort-icon { color: rgba(255,255,255,0.55); font-size: 0.7rem; }
+#qa-app .plans-table tbody tr { border-bottom: 1px solid var(--border); transition: background var(--transition); }
+#qa-app .plans-table tbody tr:nth-child(even) { background: var(--alt-row); }
+#qa-app .plans-table tbody tr:hover { background: rgba(46,134,222,0.06); }
+#qa-app .plans-table td { padding: 8px 8px; color: var(--text); vertical-align: middle; }
+#qa-app .plans-table td.editable { cursor: text; position: relative; }
+#qa-app .plans-table td.editable:hover::after {
+  content: '✎'; position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  font-size: 0.75rem; color: var(--accent); opacity: 0.7;
+}
+#qa-app .plans-table td input.cell-edit {
+  width: 100%; padding: 4px 6px; border: 1.5px solid var(--accent); border-radius: 4px;
+  font-size: 0.84rem; font-family: inherit; background: white; outline: none;
+}
+#qa-app .confidence-bar-wrap { display: flex; align-items: center; gap: 8px; }
+#qa-app .confidence-bar { flex: 1; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+#qa-app .confidence-bar-fill { height: 100%; border-radius: 3px; background: var(--success); transition: width 0.4s ease; }
+#qa-app .confidence-bar-fill.medium { background: var(--warning); }
+#qa-app .confidence-bar-fill.low    { background: var(--error); }
+#qa-app .plans-table th.cost-col, #qa-app .plans-table td.cost-col { text-align: right; white-space: nowrap; }
+#qa-app .plans-table td[data-col="planName"] { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#qa-app .plans-table td[data-col="carrier"] { max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#qa-app .er-cost { color: #2563eb; font-weight: 600; font-size: 0.85rem; }
+#qa-app .ee-cost { color: #d97706; font-weight: 600; font-size: 0.85rem; }
+
+/* ── Recommendation Cards ─────────────────────────────────────────────────── */
+#qa-app .rec-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+#qa-app .rec-card {
+  border: 2px solid var(--border); border-radius: var(--radius); padding: 24px 20px;
+  position: relative; transition: border-color var(--transition), box-shadow var(--transition), transform var(--transition);
+  background: white;
+}
+#qa-app .rec-card:hover { border-color: var(--accent); box-shadow: var(--shadow-lg); transform: translateY(-2px); }
+#qa-app .rec-card.rank-1 { border-color: #d4af37; }
+#qa-app .rec-card.rank-2 { border-color: #9e9e9e; }
+#qa-app .rec-card.rank-3 { border-color: #cd7f32; }
+#qa-app .rec-card.lowest-cost { border-color: #27ae60; }
+#qa-app .rec-rank-badge {
+  position: absolute; top: -13px; left: 16px; padding: 4px 14px; border-radius: 20px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 0.72rem; font-weight: 700; color: white; text-transform: uppercase;
+  letter-spacing: 0.04em; white-space: nowrap; box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+}
+#qa-app .rank-1 .rec-rank-badge { background: #d4af37; }
+#qa-app .rank-2 .rec-rank-badge { background: #9e9e9e; }
+#qa-app .rank-3 .rec-rank-badge { background: #cd7f32; }
+#qa-app .rec-rank-badge.lowest-cost-badge { background: #27ae60 !important; }
+#qa-app .rec-carrier {
+  font-size: 0.78rem; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.06em; margin-top: 16px; margin-bottom: 4px;
+}
+#qa-app .rec-plan-name {
+  font-size: 1.05rem; font-weight: 700; color: var(--primary); line-height: 1.3; margin-bottom: 14px;
+}
+#qa-app .score-section { margin-bottom: 16px; }
+#qa-app .score-label {
+  display: flex; justify-content: space-between; font-size: 0.78rem; font-weight: 600;
+  color: var(--muted); margin-bottom: 5px;
+}
+#qa-app .score-value { font-size: 1.2rem; font-weight: 700; color: var(--accent); }
+#qa-app .score-bar { height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; }
+#qa-app .score-bar-fill {
+  height: 100%; background: linear-gradient(90deg, var(--accent), #5ba3e8); border-radius: 4px;
+  transition: width 0.6s ease;
+}
+#qa-app .rec-metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+#qa-app .rec-metric { background: var(--alt-row); border-radius: var(--radius-sm); padding: 9px 10px; }
+#qa-app .rec-metric-label {
+  font-size: 0.7rem; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 3px;
+}
+#qa-app .rec-metric-value { font-size: 0.92rem; font-weight: 700; color: var(--text); }
+#qa-app .rec-rates { margin-top: 6px; margin-bottom: 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; background: var(--alt-row); }
+#qa-app .rec-rates-title { font-size: 0.7rem; font-weight: 700; color: var(--primary); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
+#qa-app .rec-rates-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; }
+#qa-app .rec-rate-item { display: flex; justify-content: space-between; align-items: center; }
+#qa-app .rec-rate-label { font-size: 0.75rem; color: var(--muted); font-weight: 600; }
+#qa-app .rec-rate-value { font-size: 0.85rem; font-weight: 700; color: var(--text); }
+#qa-app .rec-why {
+  font-size: 0.8rem; color: var(--muted); font-style: italic; line-height: 1.5;
+  border-top: 1px solid var(--border); padding-top: 12px; margin-top: 4px;
+}
+#qa-app .rec-contribution { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+#qa-app .rec-peremp { margin-top: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px 12px; background: var(--alt-row); }
+#qa-app .rec-peremp-title { font-size: 0.7rem; font-weight: 700; color: var(--primary); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 8px; }
+#qa-app .rec-peremp-header { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; padding-bottom: 4px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+#qa-app .rec-peremp-hdr-label { font-size: 0.65rem; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; text-align: right; }
+#qa-app .rec-peremp-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+#qa-app .rec-peremp-row:last-child { border-bottom: none; }
+#qa-app .rec-peremp-tier { font-size: 0.75rem; font-weight: 600; color: var(--text); }
+#qa-app .rec-peremp-er, #qa-app .rec-peremp-ee { font-size: 0.78rem; font-weight: 700; text-align: right; }
+#qa-app .rec-peremp-er { color: var(--primary); }
+#qa-app .rec-peremp-ee { color: #e67e22; }
+#qa-app .rec-contrib-title {
+  font-size: 0.73rem; font-weight: 700; color: var(--primary);
+  letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 6px;
+}
+#qa-app .rec-contrib-summary { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+#qa-app .rec-contrib-pill {
+  background: #eef5fd; border: 1px solid #d8e8f9; border-radius: var(--radius-sm); padding: 8px 9px;
+}
+#qa-app .rec-contrib-pill-label { font-size: 0.66rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+#qa-app .rec-contrib-pill-value { font-size: 0.9rem; font-weight: 700; color: var(--primary); }
+#qa-app .rec-contrib-tier-row {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 0.75rem; color: var(--text); padding: 3px 0; border-top: 1px dashed var(--border);
+}
+#qa-app .rec-contrib-tier-row:first-of-type { border-top: none; }
+
+/* ── Plan Selection ────────────────────────────────────────────────────────── */
+#qa-app .plan-select-cb { width: 18px; height: 18px; cursor: pointer; accent-color: var(--accent); }
+#qa-app .plan-select-cb:disabled { cursor: not-allowed; opacity: 0.4; }
+#qa-app .plans-table th.select-col, #qa-app .plans-table td.select-col { width: 36px; text-align: center; padding: 6px 4px; }
+#qa-app .selection-panel {
+  border: 2px solid var(--accent); border-radius: var(--radius); padding: 16px 20px;
+  background: linear-gradient(135deg, #eef5fd 0%, #f4f6f9 100%); margin-bottom: 18px;
+}
+#qa-app .selection-panel-header {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;
+}
+#qa-app .selection-panel-title {
+  font-size: 0.92rem; font-weight: 700; color: var(--primary);
+}
+#qa-app .selection-count {
+  font-size: 0.78rem; font-weight: 600; padding: 3px 10px; border-radius: 12px;
+  background: var(--accent); color: white;
+}
+#qa-app .selection-count.at-limit { background: var(--warning); }
+#qa-app .selection-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+#qa-app .selection-chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
+  background: white; border: 1px solid var(--border); border-radius: 16px;
+  font-size: 0.78rem; font-weight: 500; color: var(--text); transition: all var(--transition);
+}
+#qa-app .selection-chip:hover { border-color: var(--error); }
+#qa-app .selection-chip .chip-remove {
+  cursor: pointer; font-weight: 700; color: var(--muted); font-size: 0.85rem;
+  line-height: 1; transition: color var(--transition);
+}
+#qa-app .selection-chip .chip-remove:hover { color: var(--error); }
+#qa-app .selection-empty { font-size: 0.82rem; color: var(--muted); font-style: italic; }
+#qa-app .clear-selection-btn {
+  background: none; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 3px 10px; font-size: 0.72rem; font-weight: 600; color: var(--muted);
+  cursor: pointer; transition: all var(--transition);
+}
+#qa-app .clear-selection-btn:hover { border-color: var(--error); color: var(--error); }
+
+/* ── Output Actions ───────────────────────────────────────────────────────── */
+#qa-app .output-actions { display: flex; flex-wrap: wrap; gap: 16px; }
+#qa-app .output-assumptions { font-size: 0.82rem; color: var(--muted); margin-bottom: 14px; line-height: 1.45; }
+
+/* ── Loading Overlay ──────────────────────────────────────────────────────── */
+#qa-app .loading-overlay {
+  position: fixed; inset: 0; background: rgba(20,30,48,0.55);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 9999; backdrop-filter: blur(3px);
+}
+#qa-app .spinner-wrap {
+  background: white; border-radius: var(--radius); padding: 36px 48px;
+  text-align: center; box-shadow: var(--shadow-lg);
+}
+#qa-app .spinner {
+  width: 42px; height: 42px; border: 4px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: qaSpin 0.75s linear infinite; margin: 0 auto 14px;
+}
+#qa-app .spinner-wrap p { color: var(--muted); font-size: 0.9rem; font-weight: 500; }
+
+/* ── Toast ────────────────────────────────────────────────────────────────── */
+#qa-app .toast {
+  position: fixed; bottom: 28px; right: 28px; padding: 14px 20px;
+  border-radius: var(--radius-sm); font-size: 0.88rem; font-weight: 500;
+  color: white; max-width: 360px; box-shadow: var(--shadow-lg);
+  z-index: 10000; animation: qaSlideUp 0.25s ease; line-height: 1.5;
+}
+#qa-app .toast.success { background: var(--success); }
+#qa-app .toast.error   { background: var(--error); }
+#qa-app .toast.warning { background: var(--warning); }
+
+/* ── Footer ───────────────────────────────────────────────────────────────── */
+#qa-app .site-footer {
+  background: var(--primary); color: rgba(255,255,255,0.55);
+  font-size: 0.78rem; padding: 16px 0; text-align: center; margin-top: 32px;
+}
+
+/* ── Utilities ────────────────────────────────────────────────────────────── */
+#qa-app .qa-hidden { display: none !important; }
+
+/* ── Keyframes ────────────────────────────────────────────────────────────── */
+@keyframes qaSpin { to { transform: rotate(360deg); } }
+@keyframes qaSlideUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes qaSlideIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
+
+/* ── Responsive ───────────────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  #qa-app .rec-cards { grid-template-columns: 1fr; }
+}
+@media (max-width: 768px) {
+  #qa-app .qa-container { padding: 0 16px; }
+  #qa-app .card { padding: 20px 16px; }
+  #qa-app .logo-area h1 { font-size: 1.3rem; }
+  #qa-app .header-badge { display: none; }
+  #qa-app .form-grid { grid-template-columns: 1fr; }
+  #qa-app .output-actions { flex-direction: column; }
+  #qa-app .btn-export { min-width: 0; width: 100%; justify-content: center; }
+  #qa-app .census-grid { flex-direction: column; gap: 12px; }
+  #qa-app .census-input { width: 100%; }
+  #qa-app .contribution-grid { grid-template-columns: 1fr; }
+  #qa-app .contribution-header { display: none; }
+  #qa-app .rec-cards { grid-template-columns: 1fr; }
+  #qa-app .qa-main { padding-top: 20px; gap: 16px; }
+}
+@media (max-width: 480px) {
+  #qa-app .upload-actions { justify-content: stretch; }
+  #qa-app .btn-large { width: 100%; justify-content: center; }
+}
+</style>
+
+<div id="qa-app">
+  <!-- Loading Overlay -->
+  <div id="loadingOverlay" class="loading-overlay qa-hidden" aria-live="polite" aria-label="Loading">
+    <div class="spinner-wrap">
+      <div class="spinner"></div>
+      <p id="loadingMessage">Processing…</p>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast qa-hidden" role="alert" aria-live="assertive"></div>
+
+  <!-- Header -->
+  <header class="site-header">
+    <div class="qa-container header-inner">
+      <div class="logo-area">
+        <svg class="logo-icon" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <rect width="40" height="40" rx="10" fill="white" fill-opacity="0.15"/>
+          <path d="M8 30 L20 10 L32 30 Z" fill="white" fill-opacity="0.85"/>
+          <path d="M14 24 L20 14 L26 24 Z" fill="#2e86de"/>
+          <circle cx="20" cy="24" r="3" fill="white"/>
+        </svg>
+        <div>
+          <h1>Quote Analyzer</h1>
+          <p class="tagline">Internal Benefits Analysis Tool</p>
+        </div>
+      </div>
+      <div class="header-badge">Broker Use Only</div>
+    </div>
+  </header>
+
+  <main class="qa-container qa-main" id="mainContent">
+
+    <!-- 1. Case Information -->
+    <section class="card" id="caseInfoSection">
+      <h2 class="card-title"><span class="step-badge">1</span> Case Information</h2>
+      <div class="form-grid">
+        <div class="form-group">
+          <label for="clientName">Client Name <span class="optional">(optional)</span></label>
+          <input type="text" id="clientName" placeholder="e.g. Acme Corporation" />
+        </div>
+        <div class="form-group">
+          <label for="effectiveDate">Effective Date <span class="optional">(optional)</span></label>
+          <input type="text" id="effectiveDate" placeholder="e.g. 01/01/2025" />
+        </div>
+
+      </div>
+    </section>
+
+    <!-- 2. Upload Quote Files -->
+    <section class="card" id="uploadSection">
+      <h2 class="card-title"><span class="step-badge">2</span> Upload Quote Files</h2>
+      <div class="drop-zone" id="dropZone" role="button" tabindex="0" aria-label="File upload drop zone">
+        <div class="drop-zone-icon" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M24 6L24 32M24 6L16 14M24 6L32 14" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M8 36H40" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+            <path d="M8 36V40H40V36" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </div>
+        <p class="drop-zone-text">Drag files here or <span class="link-text">click to browse</span></p>
+        <p class="drop-zone-hint">Accepted: PDF, XLSX, XLS, CSV &nbsp;|&nbsp; Max 50 MB per file</p>
+      </div>
+      <input type="file" id="fileInput" class="qa-hidden" accept=".pdf,.xlsx,.xls,.csv" multiple aria-label="File input" />
+      <ul class="file-list" id="fileList" aria-label="Selected files" role="list"></ul>
+      <div class="upload-actions">
+        <button id="processBtn" class="btn btn-primary btn-large" disabled onclick="processFiles()">
+          <svg viewBox="0 0 20 20" fill="currentColor" class="btn-icon" aria-hidden="true"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clip-rule="evenodd"/></svg>
+          Process Files
+        </button>
+      </div>
+    </section>
+
+    <!-- 3. Census -->
+    <section class="card" id="censusSection">
+      <h2 class="card-title"><span class="step-badge">3</span> Census</h2>
+      <div class="census-grid">
+        <div class="census-group">
+          <label for="eeCount">EE <span class="census-label-sub">Employee Only</span></label>
+          <input type="number" id="eeCount" min="0" value="0" class="census-input" oninput="updateCensus()" />
+        </div>
+        <div class="census-group">
+          <label for="esCount">ES <span class="census-label-sub">Emp + Spouse</span></label>
+          <input type="number" id="esCount" min="0" value="0" class="census-input" oninput="updateCensus()" />
+        </div>
+        <div class="census-group">
+          <label for="ecCount">EC <span class="census-label-sub">Emp + Child(ren)</span></label>
+          <input type="number" id="ecCount" min="0" value="0" class="census-input" oninput="updateCensus()" />
+        </div>
+        <div class="census-group">
+          <label for="efCount">EF <span class="census-label-sub">Family</span></label>
+          <input type="number" id="efCount" min="0" value="0" class="census-input" oninput="updateCensus()" />
+        </div>
+        <div class="census-total">Total Enrolled: <strong id="censusTotal">0</strong></div>
+      </div>
+      <div class="recommend-actions">
+        <button id="recommendBtn" class="btn btn-accent" onclick="getRecommendations()" disabled>
+          <svg viewBox="0 0 20 20" fill="currentColor" class="btn-icon" aria-hidden="true"><path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.07 3.292a1 1 0 00.95.69h3.462c.969 0 1.371 1.24.588 1.81l-2.8 2.034a1 1 0 00-.364 1.118l1.07 3.292c.3.921-.755 1.688-1.54 1.118l-2.8-2.034a1 1 0 00-1.175 0l-2.8 2.034c-.784.57-1.838-.197-1.539-1.118l1.07-3.292a1 1 0 00-.364-1.118L2.98 8.72c-.783-.57-.38-1.81.588-1.81h3.461a1 1 0 00.951-.69l1.07-3.292z"/></svg>
+          Get Recommendations
+        </button>
+      </div>
+    </section>
+
+    <!-- 4. Employer Contribution Setup -->
+    <section class="card" id="contributionSection">
+      <h2 class="card-title"><span class="step-badge">4</span> Employer Contribution Setup</h2>
+      <p class="section-hint">Set employer contribution rules and payroll frequency to calculate employer vs employee per-pay-period amounts.</p>
+      <div class="form-grid contribution-top-grid">
+        <div class="form-group">
+          <label for="payrollFrequency">Payroll Frequency</label>
+          <select id="payrollFrequency" onchange="updateContributionSettings()">
+            <option value="weekly">Weekly (52 pay periods)</option>
+            <option value="biweekly" selected>Bi-Weekly (26 pay periods)</option>
+            <option value="semimonthly">Semi-Monthly (24 pay periods)</option>
+            <option value="monthly">Monthly (12 pay periods)</option>
+          </select>
+        </div>
+      </div>
+      <div class="contribution-grid" role="group" aria-label="Employer contribution inputs by tier">
+        <div class="contribution-header">Tier</div>
+        <div class="contribution-header">Contribution Type</div>
+        <div class="contribution-header">Employer Contribution Value</div>
+
+        <div class="contribution-tier-label">EE <span>Employee Only</span></div>
+        <select id="eeContributionType" onchange="updateContributionSettings()"><option value="percent" selected>Percentage (%)</option><option value="dollar">Dollar Amount ($)</option></select>
+        <input type="number" id="eeContributionValue" min="0" step="0.01" value="0" oninput="updateContributionSettings()" />
+
+        <div class="contribution-tier-label">ES <span>Emp + Spouse</span></div>
+        <select id="esContributionType" onchange="updateContributionSettings()"><option value="percent" selected>Percentage (%)</option><option value="dollar">Dollar Amount ($)</option></select>
+        <input type="number" id="esContributionValue" min="0" step="0.01" value="0" oninput="updateContributionSettings()" />
+
+        <div class="contribution-tier-label">EC <span>Emp + Child(ren)</span></div>
+        <select id="ecContributionType" onchange="updateContributionSettings()"><option value="percent" selected>Percentage (%)</option><option value="dollar">Dollar Amount ($)</option></select>
+        <input type="number" id="ecContributionValue" min="0" step="0.01" value="0" oninput="updateContributionSettings()" />
+
+        <div class="contribution-tier-label">EF <span>Family</span></div>
+        <select id="efContributionType" onchange="updateContributionSettings()"><option value="percent" selected>Percentage (%)</option><option value="dollar">Dollar Amount ($)</option></select>
+        <input type="number" id="efContributionValue" min="0" step="0.01" value="0" oninput="updateContributionSettings()" />
+      </div>
+    </section>
+
+    <!-- 5. Extracted Plans -->
+    <section class="card qa-hidden" id="plansSection">
+      <h2 class="card-title"><span class="step-badge">5</span> Extracted Plans <span class="badge-count" id="plansCount">0</span></h2>
+      <p class="section-hint">Click any cell to edit extracted values before generating recommendations.</p>
+      <div class="table-wrapper" role="region" aria-label="Extracted plans table" tabindex="0">
+        <table class="plans-table" id="plansTable">
+          <thead>
+            <tr>
+              <th class="select-col"><input type="checkbox" class="plan-select-cb" id="selectAllPlans" title="Select / deselect all (max 5)" /></th>
+              <th data-col="carrier" class="sortable" tabindex="0">Carrier <span class="sort-icon">↕</span></th>
+              <th data-col="planName" class="sortable" tabindex="0">Plan Name <span class="sort-icon">↕</span></th>
+              <th data-col="networkType" class="sortable" tabindex="0">Net <span class="sort-icon">↕</span></th>
+              <th data-col="metalLevel" class="sortable" tabindex="0">Metal <span class="sort-icon">↕</span></th>
+              <th data-col="deductibleIndividual" class="sortable" tabindex="0">Ded <span class="sort-icon">↕</span></th>
+              <th data-col="oopMaxIndividual" class="sortable" tabindex="0">OOP <span class="sort-icon">↕</span></th>
+              <th data-col="copayPCP" class="sortable" tabindex="0">PCP <span class="sort-icon">↕</span></th>
+              <th data-col="premiumEE" class="sortable" tabindex="0">EE <span class="sort-icon">↕</span></th>
+              <th data-col="premiumES" class="sortable" tabindex="0">ES <span class="sort-icon">↕</span></th>
+              <th data-col="premiumEC" class="sortable" tabindex="0">EC <span class="sort-icon">↕</span></th>
+              <th data-col="premiumEF" class="sortable" tabindex="0">EF <span class="sort-icon">↕</span></th>
+              <th class="cost-col">ER/Pay</th>
+              <th class="cost-col">EE/Pay</th>
+              <th data-col="extractionConfidence" class="sortable" tabindex="0">Conf <span class="sort-icon">↕</span></th>
+              <th>Src</th>
+            </tr>
+          </thead>
+          <tbody id="plansTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 6. Recommendations -->
+    <section class="card qa-hidden" id="recommendationsSection">
+      <h2 class="card-title"><span class="step-badge">6</span> Top Recommendations</h2>
+      <div class="rec-cards" id="recCards"></div>
+    </section>
+
+    <!-- 7. Generate Outputs -->
+    <section class="card qa-hidden" id="outputsSection">
+      <h2 class="card-title"><span class="step-badge">7</span> Generate Outputs</h2>
+      <p class="section-hint">Select up to 5 plans from the table above for your PowerPoint, or use the auto-recommended plans.</p>
+      <div class="selection-panel" id="selectionPanel">
+        <div class="selection-panel-header">
+          <span class="selection-panel-title">Selected Plans for Export</span>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="selection-count" id="selectionCount">0 / 5</span>
+            <button class="clear-selection-btn" onclick="clearPlanSelection()">Clear All</button>
+          </div>
+        </div>
+        <div class="selection-chips" id="selectionChips">
+          <span class="selection-empty" id="selectionEmpty">No plans selected — the 3 recommended plans will be used for the PowerPoint.</span>
+        </div>
+      </div>
+      <p class="output-assumptions" id="contributionSummary"></p>
+      <div class="output-actions">
+        <button class="btn btn-primary btn-export" onclick="downloadPPTX()">
+          <svg viewBox="0 0 20 20" fill="currentColor" class="btn-icon" aria-hidden="true"><path d="M3 4a2 2 0 012-2h10a2 2 0 012 2v12a2 2 0 01-2 2H5a2 2 0 01-2-2V4zm2 0v12h10V4H5z"/><path d="M7 7h6v2H7V7zm0 4h6v2H7v-2z"/></svg>
+          Download PowerPoint <span class="btn-sub">(.pptx)</span>
+        </button>
+        <button class="btn btn-secondary btn-export" onclick="downloadXLSX()">
+          <svg viewBox="0 0 20 20" fill="currentColor" class="btn-icon" aria-hidden="true"><path d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm4 9a1 1 0 100 2h4a1 1 0 100-2H8zm-1-4a1 1 0 011-1h4a1 1 0 110 2H8a1 1 0 01-1-1z"/></svg>
+          Download Excel <span class="btn-sub">(.xlsx)</span>
+        </button>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    <div class="qa-container">
+      <p>Quote Analyzer &mdash; Internal Benefits Analysis Tool &mdash; Broker Use Only</p>
+    </div>
+  </footer>
+</div>
+
+<script>
+(function() {
+  "use strict";
+
+  /* ── State ────────────────────────────────────────────────────────────── */
+  var state = {
+    caseId: null,
+    files: [],
+    plans: [],
+    census: { ee: 0, es: 0, ec: 0, ef: 0 },
+    contribution: {
+      payrollFrequency: 'biweekly',
+      tiers: {
+        ee: { type: 'percent', value: 0 },
+        es: { type: 'percent', value: 0 },
+        ec: { type: 'percent', value: 0 },
+        ef: { type: 'percent', value: 0 },
+      },
+    },
+    recommendations: null,
+    sortCol: null,
+    sortDir: 'asc',
+    selectedPlanIndices: [],
+  };
+
+  var MAX_SELECTED_PLANS = 5;
+
+  var COVERAGE_TIERS = ['ee', 'es', 'ec', 'ef'];
+  var PREMIUM_KEY_BY_TIER = { ee: 'premiumEE', es: 'premiumES', ec: 'premiumEC', ef: 'premiumEF' };
+  var PAY_PERIODS_PER_MONTH = { weekly: 52/12, biweekly: 26/12, semimonthly: 24/12, monthly: 1 };
+  var FREQ_LABEL = { weekly: 'Weekly', biweekly: 'Bi-Weekly', semimonthly: 'Semi-Monthly', monthly: 'Monthly' };
+
+  /* ── Configuration ───────────────────────────────────────────────────── */
+  // Deployed backend URL. Override via window.QUOTE_ANALYZER_API_BASE if needed.
+  var API_BASE = resolveApiBase() || 'https://quote-analyzer-api.onrender.com';
+
+  function resolveApiBase() {
+    var fromGlobal = (window.QUOTE_ANALYZER_API_BASE || (window.qaConfig && window.qaConfig.apiBase) || '');
+    var fromQuery = (new URLSearchParams(window.location.search).get('apiBase') || '');
+    return String(fromGlobal || fromQuery || '').trim().replace(/\/+$/, '');
+  }
+
+  /* ── API helpers ──────────────────────────────────────────────────────── */
+  function getApiBase() { return API_BASE; }
+
+  async function apiPost(path, body) {
+    var resp = await fetch(getApiBase() + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!resp.ok) {
+      if (resp.status === 404 && !getApiBase()) {
+        throw new Error('HTTP 404 (API endpoint not found). In WordPress, set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
+      }
+      var err = await resp.json().catch(function() { return { error: resp.statusText }; });
+      throw new Error(err.error || 'HTTP ' + resp.status);
+    }
+    return resp.json();
+  }
+  async function apiPostForm(path, formData) {
+    var resp = await fetch(getApiBase() + path, { method: 'POST', body: formData });
+    if (!resp.ok) {
+      if (resp.status === 404 && !getApiBase()) {
+        throw new Error('HTTP 404 (API endpoint not found). In WordPress, set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
+      }
+      var err = await resp.json().catch(function() { return { error: resp.statusText }; });
+      throw new Error(err.error || 'HTTP ' + resp.status);
+    }
+    return resp.json();
+  }
+  async function apiPostBlob(path, body) {
+    var resp = await fetch(getApiBase() + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!resp.ok) {
+      if (resp.status === 404 && !getApiBase()) {
+        throw new Error('HTTP 404 (API endpoint not found). In WordPress, set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
+      }
+      var err = await resp.json().catch(function() { return { error: resp.statusText }; });
+      throw new Error(err.error || 'HTTP ' + resp.status);
+    }
+    var blob = await resp.blob();
+    var cd = resp.headers.get('content-disposition') || '';
+    var match = cd.match(/filename="?([^"]+)"?/);
+    return { blob: blob, filename: match ? match[1] : 'download' };
+  }
+
+  /* ── Drag & Drop ─────────────────────────────────────────────────────── */
+  var zone = document.getElementById('dropZone');
+  var fileInput = document.getElementById('fileInput');
+  zone.addEventListener('click', function() { fileInput.click(); });
+  zone.addEventListener('keydown', function(e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } });
+  zone.addEventListener('dragenter', function(e) { e.preventDefault(); zone.classList.add('drag-over'); });
+  zone.addEventListener('dragover',  function(e) { e.preventDefault(); zone.classList.add('drag-over'); });
+  zone.addEventListener('dragleave', function(e) { if (!zone.contains(e.relatedTarget)) zone.classList.remove('drag-over'); });
+  zone.addEventListener('drop', function(e) { e.preventDefault(); zone.classList.remove('drag-over'); addFiles(Array.from(e.dataTransfer.files)); });
+  fileInput.addEventListener('change', function() { addFiles(Array.from(fileInput.files)); fileInput.value = ''; });
+
+  function addFiles(newFiles) {
+    var allowed = ['application/pdf','application/vnd.ms-excel','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','text/csv'];
+    var allowedExts = ['pdf','xlsx','xls','csv'];
+    newFiles.forEach(function(f) {
+      var ext = f.name.split('.').pop().toLowerCase();
+      if (!allowed.includes(f.type) && !allowedExts.includes(ext)) { showToast('Skipped "'+f.name+'": unsupported type','warning'); return; }
+      if (f.size > 50*1024*1024) { showToast('Skipped "'+f.name+'": exceeds 50 MB','warning'); return; }
+      if (state.files.some(function(sf) { return sf.name===f.name && sf.size===f.size; })) return;
+      state.files.push({ name:f.name, size:f.size, type:f.type, file:f });
+    });
+    renderFileList();
+  }
+  window.removeFile = function(idx) { state.files.splice(idx,1); renderFileList(); };
+
+  function renderFileList() {
+    var list = document.getElementById('fileList');
+    list.innerHTML = '';
+    state.files.forEach(function(f,i) {
+      var ext = f.name.split('.').pop().toLowerCase();
+      var li = document.createElement('li');
+      li.className = 'file-item';
+      li.innerHTML = '<span class="file-item-icon '+ext+'">'+ext.toUpperCase()+'</span><span class="file-item-info"><span class="file-item-name">'+escHtml(f.name)+'</span><span class="file-item-size">'+formatBytes(f.size)+'</span></span><button class="file-remove" onclick="removeFile('+i+')" aria-label="Remove '+escHtml(f.name)+'">✕</button>';
+      list.appendChild(li);
+    });
+    document.getElementById('processBtn').disabled = state.files.length === 0;
+  }
+
+  /* ── Process Files ───────────────────────────────────────────────────── */
+  window.processFiles = async function() {
+    if (state.files.length === 0) return;
+    showLoading(true,'Uploading files…');
+    try {
+      var formData = new FormData();
+      state.files.forEach(function(f) { formData.append('files[]',f.file,f.name); });
+      var uploadData = await apiPostForm('/upload',formData);
+      state.caseId = uploadData.caseId;
+      showLoading(true,'Parsing quote documents…');
+      var parseData = await apiPost('/parse',{caseId:state.caseId});
+      state.plans = parseData.plans || [];
+      renderPlansTable(state.plans);
+      showSection('plansSection',true);
+      document.getElementById('plansCount').textContent = state.plans.length;
+      document.getElementById('recommendBtn').disabled = state.plans.length === 0;
+      showLoading(false);
+      if (state.plans.length === 0) showToast('Files uploaded but no plans could be extracted.','warning');
+      else showToast('✓ Extracted '+state.plans.length+' plan'+(state.plans.length!==1?'s':''),'success');
+    } catch(err) { showLoading(false); showToast('Upload/parse failed: '+err.message,'error'); }
+  };
+
+  /* ── Plans Table ─────────────────────────────────────────────────────── */
+  var EDITABLE_COLS = ['carrier','planName','networkType','metalLevel','deductibleIndividual','oopMaxIndividual','copayPCP','premiumEE','premiumES','premiumEC','premiumEF'];
+  function renderPlansTable(plans) {
+    var tbody = document.getElementById('plansTableBody');
+    tbody.innerHTML = '';
+    if (plans.length===0) { tbody.innerHTML='<tr><td colspan="16" style="text-align:center;padding:24px;color:#7f8c8d">No plans extracted</td></tr>'; return; }
+    var fm = function(v) { return v!=null?'$'+Number(v).toLocaleString():'—'; };
+    var fp = function(v) { return v!=null?'$'+Number(v).toFixed(2):'—'; };
+    var fs = function(v) { return v||'—'; };
+    plans.forEach(function(plan,ri) {
+      var conf=plan.extractionConfidence||0, confPct=Math.round(conf*100), confClass=conf>=0.7?'':conf>=0.4?'medium':'low';
+      var contrib=calcContribution(plan);
+      var tr=document.createElement('tr'); tr.setAttribute('data-idx',ri);
+      // Selection checkbox cell
+      var selTd=document.createElement('td'); selTd.className='select-col';
+      var cb=document.createElement('input'); cb.type='checkbox'; cb.className='plan-select-cb';
+      cb.checked=state.selectedPlanIndices.indexOf(ri)!==-1;
+      cb.disabled=!cb.checked&&state.selectedPlanIndices.length>=MAX_SELECTED_PLANS;
+      cb.setAttribute('data-idx',ri);
+      cb.addEventListener('change',function(){togglePlanSelection(parseInt(this.getAttribute('data-idx'),10),this.checked);});
+      selTd.appendChild(cb); tr.appendChild(selTd);
+      var cells=[
+        {col:'carrier',val:fs(plan.carrier),ed:true},{col:'planName',val:fs(plan.planName),ed:true},
+        {col:'networkType',val:fs(plan.networkType),ed:true},{col:'metalLevel',val:fs(plan.metalLevel),ed:true},
+        {col:'deductibleIndividual',val:fm(plan.deductibleIndividual),ed:true},{col:'oopMaxIndividual',val:fm(plan.oopMaxIndividual),ed:true},
+        {col:'copayPCP',val:plan.copayPCP!=null?'$'+plan.copayPCP:'—',ed:true},
+        {col:'premiumEE',val:fp(plan.premiumEE),ed:true},
+        {col:'premiumES',val:fp(plan.premiumES),ed:true},
+        {col:'premiumEC',val:fp(plan.premiumEC),ed:true},
+        {col:'premiumEF',val:fp(plan.premiumEF),ed:true},
+        {col:'_erPerPay',val:'<span class="er-cost">'+(contrib.employerPerPayTotal>0?fp(contrib.employerPerPayTotal):'—')+'</span>',ed:false,css:'cost-col'},
+        {col:'_eePerPay',val:'<span class="ee-cost">'+(contrib.employeePerPayTotal>0?fp(contrib.employeePerPayTotal):'—')+'</span>',ed:false,css:'cost-col'},
+        {col:'extractionConfidence',val:'<div class="confidence-bar-wrap"><div class="confidence-bar"><div class="confidence-bar-fill '+confClass+'" style="width:'+confPct+'%"></div></div><span style="font-size:0.75rem;color:#7f8c8d;min-width:32px">'+confPct+'%</span></div>',ed:false},
+        {col:'sourceFile',val:'<span style="font-size:0.75rem;color:#7f8c8d" title="'+escHtml(plan.sourceFile||'')+'">'+escHtml(truncate(plan.sourceFile||'—',20))+'</span>',ed:false}
+      ];
+      cells.forEach(function(c) {
+        var td=document.createElement('td');
+        if(c.css)td.className=c.css;
+        if(c.ed){td.className=(td.className?td.className+' ':'')+'editable';td.setAttribute('data-col',c.col);td.setAttribute('data-idx',ri);td.innerHTML=c.val;td.addEventListener('click',startCellEdit);}
+        else{td.innerHTML=c.val;}
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    document.querySelectorAll('#qa-app .plans-table thead th.sortable').forEach(function(th){th.onclick=function(){sortTable(th.getAttribute('data-col'));};});
+    // Update select-all checkbox state
+    var selAll=document.getElementById('selectAllPlans');
+    if(selAll){
+      selAll.checked=state.selectedPlanIndices.length>0&&state.selectedPlanIndices.length===Math.min(plans.length,MAX_SELECTED_PLANS);
+      selAll.indeterminate=state.selectedPlanIndices.length>0&&state.selectedPlanIndices.length<Math.min(plans.length,MAX_SELECTED_PLANS);
+      selAll.onchange=function(){toggleSelectAll(this.checked);};
+    }
+    renderSelectionPanel();
+  }
+
+  /* ── Plan Selection Logic ─────────────────────────────────────────────── */
+  function togglePlanSelection(idx,checked) {
+    if(checked){
+      if(state.selectedPlanIndices.length>=MAX_SELECTED_PLANS){showToast('Maximum '+MAX_SELECTED_PLANS+' plans can be selected','warning');return;}
+      if(state.selectedPlanIndices.indexOf(idx)===-1)state.selectedPlanIndices.push(idx);
+    }else{
+      state.selectedPlanIndices=state.selectedPlanIndices.filter(function(i){return i!==idx;});
+    }
+    renderPlansTable(state.plans);
+  }
+  function toggleSelectAll(checked) {
+    if(checked){
+      state.selectedPlanIndices=[];
+      for(var i=0;i<Math.min(state.plans.length,MAX_SELECTED_PLANS);i++)state.selectedPlanIndices.push(i);
+    }else{
+      state.selectedPlanIndices=[];
+    }
+    renderPlansTable(state.plans);
+  }
+  window.clearPlanSelection=function(){
+    state.selectedPlanIndices=[];renderPlansTable(state.plans);
+  };
+  function removePlanSelection(idx){
+    state.selectedPlanIndices=state.selectedPlanIndices.filter(function(i){return i!==idx;});
+    renderPlansTable(state.plans);
+  }
+  function renderSelectionPanel() {
+    var chips=document.getElementById('selectionChips');
+    var countEl=document.getElementById('selectionCount');
+    var emptyEl=document.getElementById('selectionEmpty');
+    if(!chips)return;
+    chips.innerHTML='';
+    var sel=state.selectedPlanIndices;
+    if(countEl){
+      countEl.textContent=sel.length+' / '+MAX_SELECTED_PLANS;
+      countEl.className='selection-count'+(sel.length>=MAX_SELECTED_PLANS?' at-limit':'');
+    }
+    if(sel.length===0){
+      chips.innerHTML='<span class="selection-empty">No plans selected — the 3 recommended plans will be used for the PowerPoint.</span>';
+      return;
+    }
+    sel.forEach(function(idx){
+      var plan=state.plans[idx];
+      if(!plan)return;
+      var chip=document.createElement('span');chip.className='selection-chip';
+      chip.innerHTML=escHtml((plan.carrier?plan.carrier+' — ':'')+truncate(plan.planName||'Plan '+(idx+1),30))+'<span class="chip-remove" title="Remove">&times;</span>';
+      chip.querySelector('.chip-remove').addEventListener('click',function(){removePlanSelection(idx);});
+      chips.appendChild(chip);
+    });
+  }
+
+  function startCellEdit(e) {
+    var td=e.currentTarget; if(td.querySelector('input.cell-edit'))return;
+    var col=td.getAttribute('data-col'),idx=parseInt(td.getAttribute('data-idx'),10),raw=state.plans[idx][col];
+    var input=document.createElement('input');input.className='cell-edit';input.type='text';input.value=raw!=null?String(raw):'';
+    td.innerHTML='';td.appendChild(input);input.focus();input.select();
+    var commit=function(){
+      var v=input.value.trim();
+      var nums=['deductibleIndividual','deductibleFamily','oopMaxIndividual','oopMaxFamily','copayPCP','copaySpecialist','copayER','copayUrgentCare','premiumEE','premiumES','premiumEC','premiumEF','rxTier1','rxTier2','rxTier3'];
+      if(nums.includes(col)){var n=parseFloat(v.replace(/[$,]/g,''));state.plans[idx][col]=isNaN(n)?null:n;}else{state.plans[idx][col]=v||null;}
+      renderPlansTable(state.plans);document.getElementById('plansCount').textContent=state.plans.length;
+    };
+    input.addEventListener('blur',commit);
+    input.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();input.blur();}if(e.key==='Escape'){renderPlansTable(state.plans);}});
+  }
+
+  function sortTable(col) {
+    if(state.sortCol===col){state.sortDir=state.sortDir==='asc'?'desc':'asc';}else{state.sortCol=col;state.sortDir='asc';}
+    state.plans.sort(function(a,b){
+      var va=a[col],vb=b[col];if(va==null&&vb==null)return 0;if(va==null)return 1;if(vb==null)return -1;
+      if(typeof va==='number'&&typeof vb==='number')return state.sortDir==='asc'?va-vb:vb-va;
+      va=String(va).toLowerCase();vb=String(vb).toLowerCase();
+      if(va<vb)return state.sortDir==='asc'?-1:1;if(va>vb)return state.sortDir==='asc'?1:-1;return 0;
+    });
+    document.querySelectorAll('#qa-app .plans-table thead th').forEach(function(th){
+      th.classList.remove('sort-asc','sort-desc');
+      if(th.getAttribute('data-col')===col)th.classList.add(state.sortDir==='asc'?'sort-asc':'sort-desc');
+    });
+    renderPlansTable(state.plans);
+  }
+
+  /* ── Census ──────────────────────────────────────────────────────────── */
+  window.updateCensus = function() {
+    state.census = {
+      ee: parseInt(document.getElementById('eeCount').value,10)||0,
+      es: parseInt(document.getElementById('esCount').value,10)||0,
+      ec: parseInt(document.getElementById('ecCount').value,10)||0,
+      ef: parseInt(document.getElementById('efCount').value,10)||0,
+    };
+    document.getElementById('censusTotal').textContent = state.census.ee+state.census.es+state.census.ec+state.census.ef;
+    if(state.plans.length>0)renderPlansTable(state.plans);
+    if(state.recommendations)renderRecommendations(state.recommendations);
+    renderContributionSummary();
+  };
+
+  /* ── Contribution Settings ───────────────────────────────────────────── */
+  window.updateContributionSettings = function() {
+    function gt(t){var el=document.getElementById(t+'ContributionType');return el&&el.value==='dollar'?'dollar':'percent';}
+    function gv(t){var el=document.getElementById(t+'ContributionValue');var r=parseFloat(el?el.value:'0');return Number.isFinite(r)&&r>0?r:0;}
+    state.contribution={
+      payrollFrequency:document.getElementById('payrollFrequency').value||'biweekly',
+      tiers:{ee:{type:gt('ee'),value:gv('ee')},es:{type:gt('es'),value:gv('es')},ec:{type:gt('ec'),value:gv('ec')},ef:{type:gt('ef'),value:gv('ef')}}
+    };
+    if(state.recommendations)renderRecommendations(state.recommendations);
+    if(state.plans.length>0)renderPlansTable(state.plans);
+    renderContributionSummary();
+  };
+
+  function renderContributionSummary() {
+    var el=document.getElementById('contributionSummary');if(!el)return;
+    var c=state.contribution;
+    var ts=COVERAGE_TIERS.map(function(t){var r=c.tiers[t];return t.toUpperCase()+': '+(r.type==='dollar'?'$'+Number(r.value).toFixed(2):Number(r.value).toFixed(2)+'%');}).join(' | ');
+    el.textContent='Contribution assumptions — Payroll: '+(FREQ_LABEL[c.payrollFrequency]||'Bi-Weekly')+' | '+ts;
+  }
+
+  function calcContribution(plan) {
+    var freq=state.contribution.payrollFrequency||'biweekly',pppm=PAY_PERIODS_PER_MONTH[freq]||PAY_PERIODS_PER_MONTH.biweekly;
+    // EE base: what employer covers at EE level
+    var eePrem=Number(plan[PREMIUM_KEY_BY_TIER.ee])||0;
+    var eeRule=state.contribution.tiers.ee||{type:'percent',value:0};
+    var eeBase=0;
+    if(eePrem>0&&eeRule.value>0){eeBase=eeRule.type==='dollar'?Math.min(eePrem,eeRule.value):eePrem*(Math.min(100,Math.max(0,eeRule.value))/100);}
+    var byTier={},erM=0,eeM=0;
+    COVERAGE_TIERS.forEach(function(t){
+      var prem=Number(plan[PREMIUM_KEY_BY_TIER[t]])||0,enrolled=Number(state.census[t])||0;
+      var rule=state.contribution.tiers[t]||{type:'percent',value:0};
+      var erPM=0;
+      if(prem>0){
+        if(t==='ee'){erPM=eeBase;}else{
+          var surplus=Math.max(0,prem-eePrem),sc=0;
+          if(rule.value>0&&surplus>0){sc=rule.type==='dollar'?Math.min(surplus,rule.value):surplus*(Math.min(100,Math.max(0,rule.value))/100);}
+          erPM=Math.min(prem,eeBase+sc);
+        }
+      }
+      var eePM=Math.max(0,prem-erPM);erM+=erPM*enrolled;eeM+=eePM*enrolled;
+      byTier[t]={enrolled:enrolled,premiumMonthly:prem,employerPerPay:(erPM*enrolled)/pppm,employeePerPay:(eePM*enrolled)/pppm,employerPerMemberPerPay:erPM/pppm,employeePerMemberPerPay:eePM/pppm};
+    });
+    return {frequency:freq,employerPerPayTotal:erM/pppm,employeePerPayTotal:eeM/pppm,byTier:byTier};
+  }
+
+  /* ── Recommendations ─────────────────────────────────────────────────── */
+  window.getRecommendations = async function() {
+    if(!state.caseId){showToast('Please process files first','warning');return;}
+    if(state.plans.length===0){showToast('No plans to score','warning');return;}
+    showLoading(true,'Scoring plans…');
+    try {
+      var data=await apiPost('/recommend',{caseId:state.caseId,census:state.census,contribution:state.contribution});
+      state.recommendations=data;renderRecommendations(data);showSection('recommendationsSection',true);showSection('outputsSection',true);
+      showLoading(false);showToast('✓ Recommendations generated for '+data.recommendations.length+' top plans','success');
+    } catch(err){showLoading(false);showToast('Recommendations failed: '+err.message,'error');}
+  };
+
+  function renderRecommendations(data) {
+    var container=document.getElementById('recCards');container.innerHTML='';
+    var recs=data.recommendations||[];
+    var fmtC=function(v){return '$'+Number(v||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});};
+    recs.forEach(function(plan){
+      var score=Math.round((plan.totalScore||0)*100);
+      var cb=calcContribution(plan);
+      var tierLbls={ee:'EE Only',es:'EE + Spouse',ec:'EE + Child',ef:'Family'};
+      var perEmpRows=COVERAGE_TIERS.map(function(t){var d=cb.byTier[t];return '<div class="rec-peremp-row"><span class="rec-peremp-tier">'+tierLbls[t]+'</span><span class="rec-peremp-er">'+fmtC(d.employerPerMemberPerPay)+'</span><span class="rec-peremp-ee">'+fmtC(d.employeePerMemberPerPay)+'</span></div>';}).join('');
+      var recLabel=plan.recommendationLabel||(plan.rank===1?'Top Pick':plan.rank===2?'Runner-Up':'Strong Alternative');
+      var isLowest=recLabel==='Lowest Cost Option';
+      var card=document.createElement('div');card.className='rec-card rank-'+plan.rank+(isLowest?' lowest-cost':'');
+      card.innerHTML=
+        '<div class="rec-rank-badge'+(isLowest?' lowest-cost-badge':'')+'">'+ recLabel+'</div>'+
+        '<div class="rec-carrier">'+escHtml(plan.carrier||'Unknown Carrier')+'</div>'+
+        '<div class="rec-plan-name">'+escHtml(plan.planName||'Unknown Plan')+'</div>'+
+        '<div class="score-section"><div class="score-label"><span>Overall Score</span><span class="score-value">'+score+'<small style="font-size:0.7em;font-weight:400">/100</small></span></div><div class="score-bar"><div class="score-bar-fill" style="width:'+score+'%"></div></div></div>'+
+        '<div class="rec-metrics">'+
+          '<div class="rec-metric"><div class="rec-metric-label">Network</div><div class="rec-metric-value">'+escHtml(plan.networkType||'—')+'</div></div>'+
+          '<div class="rec-metric"><div class="rec-metric-label">Metal Level</div><div class="rec-metric-value">'+escHtml(plan.metalLevel||'—')+'</div></div>'+
+          '<div class="rec-metric"><div class="rec-metric-label">Deductible (Ind)</div><div class="rec-metric-value">'+(plan.deductibleIndividual!=null?'$'+Number(plan.deductibleIndividual).toLocaleString():'—')+'</div></div>'+
+          '<div class="rec-metric"><div class="rec-metric-label">OOP Max (Ind)</div><div class="rec-metric-value">'+(plan.oopMaxIndividual!=null?'$'+Number(plan.oopMaxIndividual).toLocaleString():'—')+'</div></div>'+
+          '<div class="rec-metric"><div class="rec-metric-label">PCP Copay</div><div class="rec-metric-value">'+(plan.copayPCP!=null?'$'+plan.copayPCP:'—')+'</div></div>'+
+          '<div class="rec-metric"><div class="rec-metric-label">Specialist</div><div class="rec-metric-value">'+(plan.copaySpecialist!=null?'$'+plan.copaySpecialist:'—')+'</div></div>'+
+        '</div>'+
+        '<div class="rec-rates"><div class="rec-rates-title">Composite Monthly Rates</div><div class="rec-rates-grid">'+
+          '<div class="rec-rate-item"><div class="rec-rate-label">EE Only</div><div class="rec-rate-value">'+(plan.premiumEE!=null?fmtC(plan.premiumEE):'—')+'</div></div>'+
+          '<div class="rec-rate-item"><div class="rec-rate-label">EE + Spouse</div><div class="rec-rate-value">'+(plan.premiumES!=null?fmtC(plan.premiumES):'—')+'</div></div>'+
+          '<div class="rec-rate-item"><div class="rec-rate-label">EE + Child</div><div class="rec-rate-value">'+(plan.premiumEC!=null?fmtC(plan.premiumEC):'—')+'</div></div>'+
+          '<div class="rec-rate-item"><div class="rec-rate-label">Family</div><div class="rec-rate-value">'+(plan.premiumEF!=null?fmtC(plan.premiumEF):'—')+'</div></div>'+
+        '</div></div>'+
+        '<div class="rec-peremp"><div class="rec-peremp-title">Per Employee Per Pay Period ('+(FREQ_LABEL[cb.frequency]||'Bi-Weekly')+')</div><div class="rec-peremp-header"><span></span><span class="rec-peremp-hdr-label">Employer</span><span class="rec-peremp-hdr-label">Employee</span></div>'+perEmpRows+'</div>'+
+        '<div class="rec-contribution"><div class="rec-contrib-title">Aggregate Totals Per Pay Period</div><div class="rec-contrib-summary"><div class="rec-contrib-pill"><div class="rec-contrib-pill-label">Employer Total</div><div class="rec-contrib-pill-value">'+fmtC(cb.employerPerPayTotal)+'</div></div><div class="rec-contrib-pill"><div class="rec-contrib-pill-label">Employee Total</div><div class="rec-contrib-pill-value">'+fmtC(cb.employeePerPayTotal)+'</div></div></div></div>'+
+        '<div class="rec-why">'+escHtml(plan.whyRecommended||'')+'</div>';
+      container.appendChild(card);
+    });
+    if(recs.length===0)container.innerHTML='<p style="color:#7f8c8d;text-align:center;padding:24px">No recommendations available</p>';
+  }
+
+  /* ── Downloads ────────────────────────────────────────────────────────── */
+  window.downloadPPTX = async function() {
+    if(!state.caseId){showToast('No case loaded','warning');return;}
+    showLoading(true,'Building PowerPoint…');
+    try {
+      var body={caseId:state.caseId,clientName:document.getElementById('clientName').value||'Client',effectiveDate:document.getElementById('effectiveDate').value||'',contribution:state.contribution};
+      if(state.selectedPlanIndices.length>0)body.selectedPlanIndices=state.selectedPlanIndices;
+      var r=await apiPostBlob('/export/pptx',body);
+      triggerDownload(r.blob,r.filename||'BenefitsAnalysis.pptx');showLoading(false);
+      showToast('✓ PowerPoint downloaded with '+(state.selectedPlanIndices.length>0?state.selectedPlanIndices.length+' selected':' recommended')+' plans','success');
+    } catch(err){showLoading(false);showToast('PPTX failed: '+err.message,'error');}
+  };
+  window.downloadXLSX = async function() {
+    if(!state.caseId){showToast('No case loaded','warning');return;}
+    showLoading(true,'Building Excel workbook…');
+    try {
+      var r=await apiPostBlob('/export/xlsx',{caseId:state.caseId,clientName:document.getElementById('clientName').value||'Client',effectiveDate:document.getElementById('effectiveDate').value||'',contribution:state.contribution});
+      triggerDownload(r.blob,r.filename||'BenefitsAnalysis.xlsx');showLoading(false);showToast('✓ Excel downloaded','success');
+    } catch(err){showLoading(false);showToast('XLSX failed: '+err.message,'error');}
+  };
+
+  function triggerDownload(blob,filename) {
+    var url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=filename;
+    document.body.appendChild(a);a.click();a.remove();setTimeout(function(){URL.revokeObjectURL(url);},10000);
+  }
+
+  /* ── UI Helpers ──────────────────────────────────────────────────────── */
+  var toastTimer=null;
+  function showToast(msg,type) {
+    var t=document.getElementById('toast');t.textContent=msg;t.className='toast '+type;t.classList.remove('qa-hidden');
+    if(toastTimer)clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.classList.add('qa-hidden');},4500);
+  }
+  function showLoading(vis,msg) {
+    var o=document.getElementById('loadingOverlay'),m=document.getElementById('loadingMessage');
+    if(vis){m.textContent=msg||'Processing…';o.classList.remove('qa-hidden');}else{o.classList.add('qa-hidden');}
+  }
+  function showSection(id,vis) { var el=document.getElementById(id); if(el)el.classList.toggle('qa-hidden',!vis); }
+
+  /* ── Utilities ────────────────────────────────────────────────────────── */
+  function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');}
+  function formatBytes(b){if(b<1024)return b+' B';if(b<1024*1024)return (b/1024).toFixed(1)+' KB';return (b/(1024*1024)).toFixed(1)+' MB';}
+  function truncate(s,l){return s.length>l?s.substring(0,l-1)+'…':s;}
+
+  /* ── Init ─────────────────────────────────────────────────────────────── */
+  updateCensus();
+  updateContributionSettings();
+  renderContributionSummary();
+  showSection('plansSection',false);
+  showSection('recommendationsSection',false);
+  showSection('outputsSection',false);
+
+})();
+</script>
