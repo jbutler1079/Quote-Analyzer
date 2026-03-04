@@ -317,7 +317,8 @@ const KNOWN_CARRIERS = [
   'Magellan', 'Ambetter', 'CareFirst', 'Highmark', 'Florida\\s*Blue',
   'Excellus', 'Independence', 'Medica', 'Priority\\s*Health', 'SelectHealth',
   'Allina', 'HealthPartners', 'Dean\\s*Health', 'Geisinger', 'MVP',
-  'ConnectiCare', 'EmblemHealth', 'Oxford', 'AvMed'
+  'ConnectiCare', 'EmblemHealth', 'Oxford', 'AvMed',
+  'Baylor\\s*Scott\\s*(?:&|and)\\s*White', 'BSW(?:HP)?'
 ];
 const CARRIER_PATTERN = new RegExp('\\b(' + KNOWN_CARRIERS.join('|') + ')\\b', 'i');
 
@@ -456,6 +457,26 @@ function extractPlanFromText(text, sourceFile) {
       candidates.push({ name: 'BCBS proposal grid', plans: bcbsPlans, score });
     }
   } catch (e) { console.log(`[EXTRACT] Strategy 9 error: ${e.message}`); }
+
+  // ── Strategy 10: BSW Vertical Format ─────────────────────────────────────
+  try {
+    const bswPlans = extractFromBSWVertical(text, sourceFile);
+    if (bswPlans.length > 0) {
+      const score = scoreStrategyResult(bswPlans);
+      console.log(`[EXTRACT] Strategy 10 (BSW vertical): ${bswPlans.length} plans, score=${score}`);
+      candidates.push({ name: 'BSW vertical format', plans: bswPlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 10 error: ${e.message}`); }
+
+  // ── Strategy 11: BSW Rate Sheet (concatenated tabular rows) ──────────────
+  try {
+    const bswRatePlans = extractFromBSWRateSheet(text, sourceFile);
+    if (bswRatePlans.length > 0) {
+      const score = scoreStrategyResult(bswRatePlans);
+      console.log(`[EXTRACT] Strategy 11 (BSW rate sheet): ${bswRatePlans.length} plans, score=${score}`);
+      candidates.push({ name: 'BSW rate sheet', plans: bswRatePlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 11 error: ${e.message}`); }
 
   // ── Pick the best strategy by quality score ─────────────────────────────
   let plans = [];
@@ -806,8 +827,479 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
     });
   }
 
-  if (plans.length < 3) return [];
+  if (plans.length < 1) return [];
   console.log(`[EXTRACT] Plan code rows: found ${plans.length} plans from code-prefixed lines`);
+  return plans;
+}
+
+// ── Strategy 10: BSW Vertical/Sequential Quote Format ─────────────────────────
+// Handles BSW (Baylor Scott & White) PDFs where benefits appear on separate lines
+// rather than concatenated after a plan code.  The format is:
+//   [Section: HMO Plans / PPO Plans]
+//   [Metal: Gold / Silver / Bronze]
+//   Plan ID
+//   GHG26A01
+//   Individual Deductible
+//   $1,500
+//   Family Deductible
+//   $3,000
+//   ...premiums...
+function extractFromBSWVertical(text, sourceFile) {
+  // Gate: must look like a BSW document
+  if (!/baylor\s*scott\s*(?:&|and)\s*white|bswhp/i.test(text) &&
+      !/BSW\s*(?:Premier|Access|Plus)/i.test(text)) return [];
+
+  const lines = text.split('\n');
+  const plans = [];
+  const carrier = 'Baylor Scott & White';
+
+  // BSW plan code patterns (flexible)
+  const BSW_CODE_RE = /^([PGBS][HP]G\d{2}[A-Z](?:\d{1,3}|IV))$/;
+  // Also match standalone plan codes that may have different patterns
+  const ALT_CODE_RE = /^([A-Z]{2,4}[\-]?\d{3,6}[A-Z]*)$/;
+
+  const METAL_MAP = { P: 'Platinum', G: 'Gold', S: 'Silver', B: 'Bronze' };
+  const NET_MAP   = { H: 'HMO', P: 'PPO' };
+  const SUBNET_MAP = { P: 'BSW Premier', A: 'BSW Access', D: 'BSW Plus' };
+
+  // Effective date
+  const effMatch = text.match(/Effective\s*Date[:\s]+([\d\/\-]+)/i);
+  const effectiveDate = effMatch ? effMatch[1] : null;
+
+  // Track current context from section headers
+  let currentNetwork = null;
+  let currentMetal = null;
+  let isHSA = false;
+
+  // Find all plan code positions first
+  const planPositions = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+
+    // Track section headers for network
+    if (/^HMO\s*Plans?$/i.test(line) || /^HMO$/i.test(line)) { currentNetwork = 'HMO'; continue; }
+    if (/^PPO\s*Plans?$/i.test(line) || /^PPO$/i.test(line)) { currentNetwork = 'PPO'; continue; }
+    if (/^HSA\s*Plans?$/i.test(line)) { isHSA = true; continue; }
+    if (/^(?:HMO|PPO)\s*Plans?$/i.test(line)) { isHSA = false; continue; }
+
+    // Track metal level headers
+    if (/^Platinum$/i.test(line)) { currentMetal = 'Platinum'; continue; }
+    if (/^Gold$/i.test(line))     { currentMetal = 'Gold'; continue; }
+    if (/^Silver$/i.test(line))   { currentMetal = 'Silver'; continue; }
+    if (/^Bronze$/i.test(line))   { currentMetal = 'Bronze'; continue; }
+    if (/^Expanded\s*Bronze$/i.test(line)) { currentMetal = 'Bronze'; continue; }
+
+    // Check if previous line was "Plan ID" label
+    const prevLine = i > 0 ? lines[i - 1].trim() : '';
+    const isPlanCodeContext = /^Plan\s*(?:ID|Code|Number)$/i.test(prevLine);
+
+    if (BSW_CODE_RE.test(line) || (isPlanCodeContext && ALT_CODE_RE.test(line))) {
+      planPositions.push({
+        lineIndex: i,
+        code: line,
+        network: currentNetwork,
+        metal: currentMetal,
+        isHSA,
+      });
+    }
+  }
+
+  if (planPositions.length === 0) return [];
+
+  // For each plan code, scan the surrounding lines for benefit data
+  for (let p = 0; p < planPositions.length; p++) {
+    const pos = planPositions[p];
+    const code = pos.code;
+    const startLine = pos.lineIndex;
+    // End at next plan code or end of text
+    const endLine = p + 1 < planPositions.length
+      ? planPositions[p + 1].lineIndex
+      : Math.min(startLine + 60, lines.length);
+
+    // Extract benefit fields from the block between this plan code and the next
+    const block = lines.slice(startLine, endLine);
+    const blockText = block.join('\n');
+
+    // Parse metal/network from code if not from headers
+    let metal = pos.metal;
+    let network = pos.network;
+    let subNetwork = null;
+
+    const codeM = code.match(/^([PGBS])([HP])G\d{2}([A-Z])/);
+    if (codeM) {
+      if (!metal) metal = METAL_MAP[codeM[1]] || metal;
+      if (!network) network = NET_MAP[codeM[2]] || network;
+      subNetwork = SUBNET_MAP[codeM[3]] || null;
+    }
+
+    // Scan block for labeled values using label/value pairs (may be on same or adjacent lines)
+    let ded = null, dedFam = null, oop = null, oopFam = null;
+    let pcp = null, spec = null, urgent = null, er = null;
+    let coins = null, rxT1 = null, rxT2 = null, rxT3 = null;
+    let premEE = null, premES = null, premEC = null, premEF = null;
+
+    for (let j = 0; j < block.length; j++) {
+      const line = block[j].trim();
+      const nextLine = j + 1 < block.length ? block[j + 1].trim() : '';
+
+      // Try to extract value from same line or next line
+      const valueOnLine = line.match(/\$([\d,]+(?:\.\d{2})?)/);
+      const valueNextLine = nextLine.match(/^\$([\d,]+(?:\.\d{2})?)$/);
+
+      // Combined label + value on same line (e.g., "Individual Deductible $1,500")
+      const sameLineVal = line.match(/^(.+?)\s+\$([\d,]+(?:\.\d{2})?)\s*$/);
+
+      // Individual Deductible
+      if (/^Individual\s*Deductible$/i.test(line) && valueNextLine) {
+        ded = parseMoney(valueNextLine[1]); j++;
+      } else if (/Individual\s*Deductible/i.test(line) && sameLineVal) {
+        ded = parseMoney(sameLineVal[2]);
+      } else if (/^(?:In-?Network\s*)?Deductible$/i.test(line) && valueNextLine) {
+        ded = parseMoney(valueNextLine[1]); j++;
+      }
+
+      // Family Deductible
+      if (/^Family\s*Deductible$/i.test(line) && valueNextLine) {
+        dedFam = parseMoney(valueNextLine[1]); j++;
+      } else if (/Family\s*Deductible/i.test(line) && sameLineVal) {
+        dedFam = parseMoney(sameLineVal[2]);
+      }
+
+      // OOP Max Individual
+      if (/^(?:Individual\s*)?(?:OOP|Out[\s-]*of[\s-]*Pocket)\s*(?:Max(?:imum)?|Limit)?(?:\s*Individual)?$/i.test(line) && valueNextLine) {
+        oop = parseMoney(valueNextLine[1]); j++;
+      } else if (/(?:OOP|Out[\s-]*of[\s-]*Pocket)\s*(?:Max|Limit)?\s*Individual/i.test(line) && sameLineVal) {
+        oop = parseMoney(sameLineVal[2]);
+      } else if (/Individual\s*(?:OOP|Out[\s-]*of[\s-]*Pocket)/i.test(line) && sameLineVal) {
+        oop = parseMoney(sameLineVal[2]);
+      }
+
+      // OOP Max Family
+      if (/^(?:Family\s*)?(?:OOP|Out[\s-]*of[\s-]*Pocket)\s*(?:Max(?:imum)?|Limit)?(?:\s*Family)?$/i.test(line) && valueNextLine) {
+        oopFam = parseMoney(valueNextLine[1]); j++;
+      } else if (/(?:OOP|Out[\s-]*of[\s-]*Pocket)\s*(?:Max|Limit)?\s*Family/i.test(line) && sameLineVal) {
+        oopFam = parseMoney(sameLineVal[2]);
+      } else if (/Family\s*(?:OOP|Out[\s-]*of[\s-]*Pocket)/i.test(line) && sameLineVal) {
+        oopFam = parseMoney(sameLineVal[2]);
+      }
+
+      // Coinsurance
+      const coinsMatch = line.match(/(\d+)\s*%\s*(?:Coinsurance|co[\s-]*insurance)/i) ||
+                          line.match(/Coinsurance\s*(\d+)\s*%/i);
+      if (coinsMatch) {
+        coins = coinsMatch[1];
+      } else if (/^Coinsurance$/i.test(line)) {
+        const nextVal = nextLine.match(/^(\d+)\s*%/);
+        if (nextVal) { coins = nextVal[1]; j++; }
+      }
+
+      // PCP / Primary Care
+      if (/^(?:Primary\s*Care|PCP)(?:\s*(?:Office\s*)?(?:Visit|Copay))?$/i.test(line) && valueNextLine) {
+        pcp = parseMoney(valueNextLine[1]); j++;
+      } else if (/(?:Primary\s*Care|PCP)/i.test(line) && sameLineVal) {
+        pcp = parseMoney(sameLineVal[2]);
+      }
+
+      // Specialist
+      if (/^Specialist(?:\s*(?:Office\s*)?(?:Visit|Copay))?$/i.test(line) && valueNextLine) {
+        spec = parseMoney(valueNextLine[1]); j++;
+      } else if (/Specialist/i.test(line) && sameLineVal && !/OOP|Deductible|Premium/i.test(line)) {
+        spec = parseMoney(sameLineVal[2]);
+      }
+
+      // Urgent Care
+      if (/^Urgent\s*Care$/i.test(line) && valueNextLine) {
+        urgent = parseMoney(valueNextLine[1]); j++;
+      } else if (/Urgent\s*Care/i.test(line) && sameLineVal) {
+        urgent = parseMoney(sameLineVal[2]);
+      }
+
+      // ER / Emergency Room
+      if (/^(?:ER|Emergency\s*Room)$/i.test(line) && valueNextLine) {
+        er = parseMoney(valueNextLine[1]); j++;
+      } else if (/(?:ER|Emergency\s*Room)/i.test(line) && sameLineVal) {
+        er = parseMoney(sameLineVal[2]);
+      }
+
+      // Rx tiers — "Rx: $10/$40/$80" or "$10/$40/$80" or separate lines
+      const rxMatch = line.match(/\$(\d+)\s*\/\s*\$(\d+)\s*\/\s*\$(\d+)/);
+      if (rxMatch) {
+        rxT1 = parseInt(rxMatch[1], 10);
+        rxT2 = parseInt(rxMatch[2], 10);
+        rxT3 = parseInt(rxMatch[3], 10);
+      }
+
+      // Rx tiers with 4 values: $10/$40/$80/$150
+      const rx4Match = line.match(/\$(\d+)\s*\/\s*\$(\d+)\s*\/\s*\$(\d+)\s*\/\s*\$(\d+)/);
+      if (rx4Match) {
+        rxT1 = parseInt(rx4Match[1], 10);
+        rxT2 = parseInt(rx4Match[2], 10);
+        rxT3 = parseInt(rx4Match[3], 10);
+      }
+
+      // Premiums — label on one line, value on next
+      if (/^Employee\s*Only$/i.test(line) && valueNextLine) {
+        premEE = parseMoney(valueNextLine[1]); j++;
+      } else if (/Employee\s*Only/i.test(line) && sameLineVal) {
+        premEE = parseMoney(sameLineVal[2]);
+      } else if (/^(?:EE|Single)$/i.test(line) && valueNextLine) {
+        premEE = parseMoney(valueNextLine[1]); j++;
+      }
+
+      if (/^Employee\s*\+\s*Spouse$/i.test(line) && valueNextLine) {
+        premES = parseMoney(valueNextLine[1]); j++;
+      } else if (/Employee\s*\+\s*Spouse/i.test(line) && sameLineVal) {
+        premES = parseMoney(sameLineVal[2]);
+      } else if (/^(?:ES|Emp\s*\+\s*Sp)$/i.test(line) && valueNextLine) {
+        premES = parseMoney(valueNextLine[1]); j++;
+      }
+
+      if (/^Employee\s*\+\s*Child(?:ren|\(ren\))?$/i.test(line) && valueNextLine) {
+        premEC = parseMoney(valueNextLine[1]); j++;
+      } else if (/Employee\s*\+\s*Child/i.test(line) && sameLineVal) {
+        premEC = parseMoney(sameLineVal[2]);
+      } else if (/^(?:EC|Emp\s*\+\s*Ch)$/i.test(line) && valueNextLine) {
+        premEC = parseMoney(valueNextLine[1]); j++;
+      }
+
+      if (/^Family$/i.test(line) && valueNextLine && premEE != null) {
+        // Only match "Family" as premium if we already found EE premium (avoids matching "Family Deductible")
+        premEF = parseMoney(valueNextLine[1]); j++;
+      } else if (/^Family\b/i.test(line) && !/Deductible|OOP|Out.of.Pocket/i.test(line) && sameLineVal && premEE != null) {
+        premEF = parseMoney(sameLineVal[2]);
+      } else if (/^Employee\s*\+\s*Family$/i.test(line) && valueNextLine) {
+        premEF = parseMoney(valueNextLine[1]); j++;
+      } else if (/Employee\s*\+\s*Family/i.test(line) && sameLineVal) {
+        premEF = parseMoney(sameLineVal[2]);
+      } else if (/^(?:EF|Emp\s*\+\s*Fam)$/i.test(line) && valueNextLine) {
+        premEF = parseMoney(valueNextLine[1]); j++;
+      }
+
+      // Handle "Deductible / OOP" combo line: "$1,500 / $6,000" type
+      const comboMatch = line.match(/^\$(\d[\d,]*)\s*\/\s*\$(\d[\d,]*)$/);
+      if (comboMatch && !ded && !oop) {
+        ded = parseMoney(comboMatch[1]);
+        oop = parseMoney(comboMatch[2]);
+      }
+    }
+
+    // Build plan name
+    let planName;
+    const metalStr = metal || 'Plan';
+    const netStr = network || '';
+    if (pos.isHSA) {
+      planName = `${metalStr} ${netStr} HSA`.trim();
+    } else if (ded != null && ded === 0) {
+      planName = `${metalStr} ${netStr} Copay`.trim();
+    } else if (ded != null && coins != null) {
+      const planPays = 100 - parseInt(coins, 10);
+      planName = `${metalStr} ${netStr} ${planPays} $${ded.toLocaleString()} Ded`.trim();
+    } else if (ded != null) {
+      planName = `${metalStr} ${netStr} $${ded.toLocaleString()} Ded`.trim();
+    } else {
+      planName = `${metalStr} ${netStr}`.trim();
+    }
+    if (subNetwork) planName += ` (${subNetwork})`;
+
+    const BENEFIT_FIELDS = [ded, dedFam, oop, oopFam, pcp, spec, urgent, er, premEE, premES, premEC, premEF];
+    const benefitCount = BENEFIT_FIELDS.filter(v => v != null).length;
+
+    // Only add plan if we found at least some real data
+    if (benefitCount < 2) continue;
+
+    plans.push({
+      id: uuidv4(), carrier,
+      planName, planCode: code, networkType: network, metalLevel: metal,
+      deductibleIndividual: ded, deductibleFamily: dedFam,
+      oopMaxIndividual: oop, oopMaxFamily: oopFam,
+      coinsurance: coins ? `${coins}%` : null,
+      copayPCP: pcp, copaySpecialist: spec,
+      copayUrgentCare: urgent, copayER: er,
+      rxDeductible: null,
+      rxTier1: rxT1, rxTier2: rxT2, rxTier3: rxT3,
+      premiumEE: premEE, premiumES: premES,
+      premiumEC: premEC, premiumEF: premEF,
+      effectiveDate, ratingArea: null, underwritingNotes: null,
+      extractionConfidence: Math.min(1, 0.3 + (benefitCount * 0.06)),
+      sourceFile,
+    });
+  }
+
+  if (plans.length === 0) return [];
+  console.log(`[EXTRACT] BSW vertical: found ${plans.length} plans`);
+  return plans;
+}
+
+// ── Strategy 11: BSW Rate Sheet (concatenated tabular rows) ───────────────────
+// Handles BSW renewal/proposal rate sheets where each plan is a single row with
+// concatenated columns:
+//   [Code][BSW Network][ProductType][Coins%][$Ded/$OOP][$PCP/$Spec][RxCode][RxTiers]
+// followed by a premium line:
+//   $EE$ES$EC$EF
+// Example:
+//   LC6QB2L2BSW Premier HMOCC8020%$5000/$7000$25/$50LGRXHE26$5/$15/$60/$130
+//   $634.50$1,395.90$1,142.10$2,030.39
+function extractFromBSWRateSheet(text, sourceFile) {
+  // Gate: must contain a BSW network name in a concatenated data context
+  if (!/BSW\s+(?:Premier|Access|Plus)\s+(?:HMO|PPO|EPO)/i.test(text)) return [];
+
+  const lines = text.split('\n');
+  const plans = [];
+  const carrier = 'Baylor Scott & White';
+
+  // Effective date
+  let effectiveDate = null;
+  const effMatch1 = text.match(/(?:Renewal\s+)?Effective(?:\s+Date)?(?:\s+of)?\s*[:\s]\s*(\d{1,2}\/\d{1,2}\/\d{4})/i);
+  const effMatch2 = text.match(/(\w+\s+\d{1,2},?\s*\d{4})\s+to\s+/i);
+  if (effMatch1) effectiveDate = effMatch1[1];
+  else if (effMatch2) effectiveDate = effMatch2[1];
+
+  // Plan data line: [planCode][BSW network]...
+  const BSW_PLAN_RE = /^([A-Z0-9]{4,16})(BSW\s+(?:Premier|Access|Plus)\s+(?:HMO|PPO|EPO))\s*/i;
+
+  // Product type + coinsurance: CC80→20%, CC100 HDHP→0%, etc.
+  // Use alternation so CC100 is tried before \d{2} to prevent CC10 + 0... mis-parse
+  const PRODUCT_RE = /^(CC(?:100|\d{2}))(\s*HDHP)?\s*(\d{1,2})%\s*/;
+
+  // Ded/OOP: $5000/$7000
+  const DED_OOP_RE = /^\$([\d,]+)\/\$([\d,]+)\s*/;
+
+  // Copay: $25/$50
+  const COPAY_RE = /^\$(\d+)\/\$(\d+)\s*/;
+
+  // "Ded + 0%" or "Ded +0%" style (HDHP copay placeholder)
+  const DED_COPAY_RE = /^Ded\s*\+\s*\d+%\s*/i;
+
+  // Premium line: 4+ consecutive $amounts with cents
+  const PREM_4_RE = /^\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})/;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+
+    const planMatch = BSW_PLAN_RE.exec(line);
+    if (!planMatch) continue;
+
+    const planCode = planMatch[1];
+    const networkRaw = planMatch[2].trim();
+    let rest = line.slice(planMatch[0].length);
+
+    // Parse product type and coinsurance
+    const prodMatch = PRODUCT_RE.exec(rest);
+    if (!prodMatch) continue;
+
+    const productLabel = prodMatch[1] + (prodMatch[2] || '').trim();
+    const coinsurance = parseInt(prodMatch[3], 10);
+    const isHDHP = /HDHP/i.test(productLabel);
+    rest = rest.slice(prodMatch[0].length);
+
+    // Parse deductible / OOP max
+    const dedMatch = DED_OOP_RE.exec(rest);
+    if (!dedMatch) continue;
+
+    const deductible = parseMoney(dedMatch[1]);
+    const oopMax = parseMoney(dedMatch[2]);
+    rest = rest.slice(dedMatch[0].length);
+
+    // Parse PCP/Spec copays or "Ded + X%"
+    let pcp = null, spec = null;
+    const copayMatch = COPAY_RE.exec(rest);
+    const dedCopayMatch = DED_COPAY_RE.exec(rest);
+
+    if (copayMatch) {
+      pcp = parseInt(copayMatch[1], 10);
+      spec = parseInt(copayMatch[2], 10);
+      rest = rest.slice(copayMatch[0].length);
+    } else if (dedCopayMatch) {
+      rest = rest.slice(dedCopayMatch[0].length);
+    }
+
+    // Parse Rx tiers — skip Rx plan code (alphanumeric), find $X/$Y/$Z or $X/$Y/$Z/$W
+    let rxT1 = null, rxT2 = null, rxT3 = null;
+    const rx4Match = rest.match(/\$(\d+)\/\$(\d+)\/\$(\d+)\/\$(\d+)/);
+    const rx3Match = rest.match(/\$(\d+)\/\$(\d+)\/\$(\d+)/);
+
+    if (rx4Match) {
+      rxT1 = parseInt(rx4Match[1], 10);
+      rxT2 = parseInt(rx4Match[2], 10);
+      rxT3 = parseInt(rx4Match[3], 10);
+    } else if (rx3Match) {
+      rxT1 = parseInt(rx3Match[1], 10);
+      rxT2 = parseInt(rx3Match[2], 10);
+      rxT3 = parseInt(rx3Match[3], 10);
+    }
+
+    // Look ahead for premium line (next non-empty line)
+    let premEE = null, premES = null, premEC = null, premEF = null;
+    for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+      const nextLine = lines[j].trim();
+      if (!nextLine) continue;
+      if (BSW_PLAN_RE.test(nextLine)) break;
+
+      const premMatch = PREM_4_RE.exec(nextLine);
+      if (premMatch) {
+        premEE = parseMoney(premMatch[1]);
+        premES = parseMoney(premMatch[2]);
+        premEC = parseMoney(premMatch[3]);
+        premEF = parseMoney(premMatch[4]);
+        break;
+      }
+    }
+
+    // Network type
+    let networkType = null;
+    if (/HMO/i.test(networkRaw)) networkType = 'HMO';
+    else if (/PPO/i.test(networkRaw)) networkType = 'PPO';
+    else if (/EPO/i.test(networkRaw)) networkType = 'EPO';
+
+    // Sub-network
+    let subNetwork = null;
+    if (/Premier/i.test(networkRaw)) subNetwork = 'BSW Premier';
+    else if (/Access/i.test(networkRaw)) subNetwork = 'BSW Access';
+    else if (/Plus/i.test(networkRaw)) subNetwork = 'BSW Plus';
+
+    // Metal level estimate from plan design
+    let metalLevel = null;
+    if (isHDHP) {
+      metalLevel = deductible >= 6000 ? 'Bronze' : 'Silver';
+    } else {
+      if (coinsurance <= 10) metalLevel = 'Platinum';
+      else if (coinsurance <= 20) metalLevel = 'Gold';
+      else if (coinsurance <= 30) metalLevel = 'Silver';
+      else metalLevel = 'Bronze';
+    }
+
+    // Build descriptive plan name
+    let planName;
+    if (isHDHP) {
+      planName = `${subNetwork || networkRaw} ${networkType} HDHP $${deductible.toLocaleString()} Ded`;
+    } else {
+      const planPays = 100 - coinsurance;
+      planName = `${subNetwork || networkRaw} ${networkType} ${planPays}/${coinsurance} $${deductible.toLocaleString()} Ded`;
+    }
+
+    const benefitFields = [deductible, oopMax, pcp, spec, premEE, premES, premEC, premEF, rxT1].filter(v => v != null).length;
+
+    plans.push({
+      id: uuidv4(), carrier,
+      planName, planCode, networkType, metalLevel,
+      deductibleIndividual: deductible, deductibleFamily: null,
+      oopMaxIndividual: oopMax, oopMaxFamily: null,
+      coinsurance: `${coinsurance}%`,
+      copayPCP: pcp, copaySpecialist: spec,
+      copayUrgentCare: null, copayER: null,
+      rxDeductible: null,
+      rxTier1: rxT1, rxTier2: rxT2, rxTier3: rxT3,
+      premiumEE: premEE, premiumES: premES,
+      premiumEC: premEC, premiumEF: premEF,
+      effectiveDate, ratingArea: null, underwritingNotes: null,
+      extractionConfidence: Math.min(1, 0.3 + (benefitFields * 0.08)),
+      sourceFile,
+    });
+  }
+
+  if (plans.length === 0) return [];
+  console.log(`[EXTRACT] BSW rate sheet: found ${plans.length} plans`);
   return plans;
 }
 
@@ -1773,6 +2265,7 @@ function normalizeCarrier(raw) {
   const up = raw.replace(/\s+/g, ' ').trim();
   if (/bcbs|blue\s*cross/i.test(up)) return 'BCBS';
   if (/united\s*health/i.test(up)) return 'UnitedHealthcare';
+  if (/baylor|bsw/i.test(up)) return 'Baylor Scott & White';
   return up.charAt(0).toUpperCase() + up.slice(1);
 }
 
