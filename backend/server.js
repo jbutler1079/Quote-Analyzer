@@ -158,7 +158,7 @@ const upload = multer({
 // ── Auth middleware (disabled – internal tool) ───────────────────────────────
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'bcbs-strategy9-v2', strategies: 9 }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'bsw-strategy10-v3', strategies: 10 }));
 
 // ── Debug: last extraction info ───────────────────────────────────────────────
 app.get('/debug/lastextract', (_req, res) => {
@@ -317,7 +317,8 @@ const KNOWN_CARRIERS = [
   'Magellan', 'Ambetter', 'CareFirst', 'Highmark', 'Florida\\s*Blue',
   'Excellus', 'Independence', 'Medica', 'Priority\\s*Health', 'SelectHealth',
   'Allina', 'HealthPartners', 'Dean\\s*Health', 'Geisinger', 'MVP',
-  'ConnectiCare', 'EmblemHealth', 'Oxford', 'AvMed'
+  'ConnectiCare', 'EmblemHealth', 'Oxford', 'AvMed',
+  'Baylor\\s*Scott\\s*(?:&|and)\\s*White',
 ];
 const CARRIER_PATTERN = new RegExp('\\b(' + KNOWN_CARRIERS.join('|') + ')\\b', 'i');
 
@@ -432,8 +433,10 @@ function extractPlanFromText(text, sourceFile) {
     const codeRowPlans = extractFromPlanCodeBenefitRows(text, sourceFile);
     if (codeRowPlans.length > 0) {
       const score = scoreStrategyResult(codeRowPlans);
-      console.log(`[EXTRACT] Strategy 7 (plan code rows): ${codeRowPlans.length} plans, score=${score}`);
-      candidates.push({ name: 'plan code benefit rows', plans: codeRowPlans, score });
+      // Apply a 10% boost so that the carrier-specific BSW parser wins over generic strategies.
+      const boostedScore = score * 1.10;
+      console.log(`[EXTRACT] Strategy 7 (plan code rows): ${codeRowPlans.length} plans, score=${score} (boosted=${boostedScore.toFixed(2)})`);
+      candidates.push({ name: 'plan code benefit rows', plans: codeRowPlans, score: boostedScore });
     }
   } catch (e) { console.log(`[EXTRACT] Strategy 7 error: ${e.message}`); }
 
@@ -456,6 +459,19 @@ function extractPlanFromText(text, sourceFile) {
       candidates.push({ name: 'BCBS proposal grid', plans: bcbsPlans, score });
     }
   } catch (e) { console.log(`[EXTRACT] Strategy 9 error: ${e.message}`); }
+
+  // ── Strategy 10: BSW Tabular Comparison Grid ─────────────────────────────
+  try {
+    const bswTabularPlans = extractFromBSWTabularGrid(text, sourceFile);
+    if (bswTabularPlans.length > 0) {
+      const score = scoreStrategyResult(bswTabularPlans);
+      // Apply a 10% boost so that the carrier-specific BSW parser wins over generic
+      // strategies (benefit grid, rate table) when scores are otherwise equal.
+      const boostedScore = score * 1.10;
+      console.log(`[EXTRACT] Strategy 10 (BSW tabular grid): ${bswTabularPlans.length} plans, score=${score} (boosted=${boostedScore.toFixed(2)})`);
+      candidates.push({ name: 'BSW tabular grid', plans: bswTabularPlans, score: boostedScore });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 10 error: ${e.message}`); }
 
   // ── Pick the best strategy by quality score ─────────────────────────────
   let plans = [];
@@ -652,8 +668,9 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
   let carrier = null;
   if (/baylor\s*scott\s*(?:&|and)\s*white/i.test(text)) carrier = 'Baylor Scott & White';
 
-  // Regex for premium line: $EE$ES$EC$EF$Total (5 dollar amounts with decimals)
-  const PREMIUM_LINE_RE = /^\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})$/;
+  // Regex for premium line: $EE$ES$EC$EF[$Total] — 4 or 5 dollar amounts with decimals.
+  // The fifth value (monthly total) is present in some BSW PDFs but omitted in others.
+  const PREMIUM_LINE_RE = /^\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})\$([\d,]+\.\d{2})(?:\$([\d,]+\.\d{2}))?$/;
   // Regex for Rx tier line: $3/$50/$125/$250 etc
   const RX_LINE_RE = /^\$(\d+)\/\$(\d+)\/\$(\d+)\/\$(\d+)$/;
 
@@ -663,12 +680,13 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
    *   [optional Rx line like "$3/$50/$125/$250"]
    *   [optional "0% copayment after" / "deductible" for HSA]
    *   [premium line like "$825.02$1,650.04$1,650.04$2,475.06$7,425.14"]
+   * Some PDFs omit the fifth (total) value: "$825.02$1,650.04$1,650.04$2,475.06"
    */
   function lookAheadForPremiums(startIdx) {
     const result = { premiumEE: null, premiumES: null, premiumEC: null, premiumEF: null,
                      rxTier1: null, rxTier2: null, rxTier3: null };
-    // Search the next 5 lines for premium and Rx data
-    for (let j = startIdx + 1; j < Math.min(startIdx + 6, lines.length); j++) {
+    // Search the next 8 lines for premium and Rx data (some PDFs have extra rows between code and premiums)
+    for (let j = startIdx + 1; j < Math.min(startIdx + 9, lines.length); j++) {
       const ahead = lines[j].trim();
       if (!ahead) continue;
 
@@ -684,13 +702,14 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
         continue;
       }
 
-      // Check for premium line (5 dollar amounts with cents)
+      // Check for premium line (4 or 5 dollar amounts with cents)
       const premMatch = PREMIUM_LINE_RE.exec(ahead);
       if (premMatch) {
         result.premiumEE = parseMoney(premMatch[1]);
         result.premiumES = parseMoney(premMatch[2]);
         result.premiumEC = parseMoney(premMatch[3]);
         result.premiumEF = parseMoney(premMatch[4]);
+        // premMatch[5] is the optional monthly total — not needed
         break; // Found premiums, stop looking
       }
 
@@ -724,12 +743,14 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
     // Look ahead for premiums and Rx
     const extras = lookAheadForPremiums(i);
 
-    // --- HSA format: $DED0% AD / 0% AD0% copayment after deductible$OOP ---
-    const hsaRe = /^\$(\d{1,3}(?:,\d{3})*)0%\s*AD\s*\/\s*0%\s*AD\s*0%\s*co(?:payment|insurance)\s+after\s+deductible\$([\d,]+)/;
+    // --- HSA format: $DED[ / $FAMDED]0% AD / 0% AD0% copayment after deductible$OOP[ / $FAMOOP] ---
+    const hsaRe = /^\$([\d,]+)(?:\s*\/\s*\$([\d,]+))?0%\s*AD\s*\/\s*0%\s*AD\s*0%\s*co(?:payment|insurance)\s+after\s+deductible\$([\d,]+)(?:\s*\/\s*\$([\d,]+))?/;
     const hsaMatch = hsaRe.exec(rest);
     if (hsaMatch) {
       const ded = parseMoney(hsaMatch[1]);
-      const oop = parseMoney(hsaMatch[2]);
+      const dedFam = hsaMatch[2] ? parseMoney(hsaMatch[2]) : null;
+      const oop = parseMoney(hsaMatch[3]);
+      const oopFam = hsaMatch[4] ? parseMoney(hsaMatch[4]) : null;
       const hasPremiums = extras.premiumEE != null;
       const benefitCount = [ded, oop].filter(v => v != null).length + (hasPremiums ? 4 : 0);
 
@@ -737,8 +758,8 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
         id: uuidv4(), carrier,
         planName: `${metal} ${network} HSA $${ded.toLocaleString()}${subNetwork ? ' (' + subNetwork + ')' : ''}`,
         planCode: code, networkType: network, metalLevel: metal,
-        deductibleIndividual: ded, deductibleFamily: null,
-        oopMaxIndividual: oop, oopMaxFamily: null,
+        deductibleIndividual: ded, deductibleFamily: dedFam,
+        oopMaxIndividual: oop, oopMaxFamily: oopFam,
         coinsurance: '0% after deductible',
         copayPCP: null, copaySpecialist: null,
         copayUrgentCare: null, copayER: null,
@@ -753,15 +774,19 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
       continue;
     }
 
-    // --- Standard format: $DED$PCP [AD] / $SPEC_COINS% copay... $OOP ---
-    const stdRe = /^\$([\d,]+)\$(\d+)\s*(?:AD\s*)?\/\s*\$(.+?)%\s*co(?:payment|insurance)(?:\s+after\s+deductible)?\$([\d,]+)/;
+    // --- Standard format: $DED[ / $FAMDED]$PCP [AD] / $SPEC_COINS% copay...$OOP[ / $FAMOOP] ---
+    // Also handles optional ER ($NNN) and Urgent Care ($NNN) copays before OOP, e.g.:
+    //   $1,000 / $2,000$30 / $6020% copayment after deductible$300$75$5,000 / $10,000
+    const stdRe = /^\$([\d,]+)(?:\s*\/\s*\$([\d,]+))?\$(\d+)\s*(?:AD\s*)?\/\s*\$(.+?)%\s*co(?:payment|insurance)(?:\s+after\s+deductible)?\$([\d,]+)(?:\s*\/\s*\$([\d,]+))?/;
     const stdMatch = stdRe.exec(rest);
     if (!stdMatch) continue;
 
     const ded = parseMoney(stdMatch[1]);
-    const pcp = parseInt(stdMatch[2], 10);
-    const specCoinsRaw = stdMatch[3].trim();
-    const oop = parseMoney(stdMatch[4]);
+    const dedFam = stdMatch[2] ? parseMoney(stdMatch[2]) : null;
+    const pcp = parseInt(stdMatch[3], 10);
+    const specCoinsRaw = stdMatch[4].trim();
+    const oop = parseMoney(stdMatch[5]);
+    const oopFam = stdMatch[6] ? parseMoney(stdMatch[6]) : null;
 
     let spec = null, coins = null;
     const adSplit = specCoinsRaw.match(/^(\d+)\s*AD\s*(\d+)$/);
@@ -773,6 +798,29 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
       if (/^\d+$/.test(pureDigits)) {
         const result = splitSpecCoins(pureDigits);
         if (result) { spec = result.spec; coins = result.coins; }
+      }
+    }
+
+    // Try to extract ER and Urgent Care copays that may appear between coinsurance and OOP.
+    // These look like embedded $NNN values in the remainder of the benefit string.
+    let copayER = null, copayUrgentCare = null;
+    const postCoinsIdx = rest.indexOf('% co');
+    if (postCoinsIdx !== -1) {
+      // Find the text between coinsurance keyword and the OOP dollar value
+      const afterCoins = rest.substring(postCoinsIdx);
+      // Match up to 2 additional dollar amounts before the OOP: $ER$UC$OOP
+      const extraCopayRe = /\$([\d,]+)(?:\s*\/\s*\$([\d,]+))?\$([\d,]+)(?:\s*\/\s*\$([\d,]+))?\$([\d,]+)/;
+      const ecm = extraCopayRe.exec(afterCoins);
+      if (ecm) {
+        // If we find two dollar amounts before the known OOP value, treat them as ER/UC
+        const c1 = parseMoney(ecm[1]);
+        const c3 = parseMoney(ecm[3]);
+        const c5 = parseMoney(ecm[5]);
+        if (c5 != null && c1 != null && c3 != null) {
+          copayER = c1;
+          copayUrgentCare = c3;
+          // c5 would be OOP — but we already captured oop from stdRe above
+        }
       }
     }
 
@@ -791,11 +839,11 @@ function extractFromPlanCodeBenefitRows(text, sourceFile) {
     plans.push({
       id: uuidv4(), carrier,
       planName, planCode: code, networkType: network, metalLevel: metal,
-      deductibleIndividual: ded, deductibleFamily: null,
-      oopMaxIndividual: oop, oopMaxFamily: null,
+      deductibleIndividual: ded, deductibleFamily: dedFam,
+      oopMaxIndividual: oop, oopMaxFamily: oopFam,
       coinsurance: coins != null ? `${coins}%` : null,
       copayPCP: pcp, copaySpecialist: spec,
-      copayUrgentCare: null, copayER: null,
+      copayUrgentCare, copayER,
       rxDeductible: null,
       rxTier1: extras.rxTier1, rxTier2: extras.rxTier2, rxTier3: extras.rxTier3,
       premiumEE: extras.premiumEE, premiumES: extras.premiumES,
@@ -1257,7 +1305,268 @@ function extractFromBCBSGrid(text, sourceFile) {
   return plans;
 }
 
-// ── Strategy 6: Repeated-keyword extraction ───────────────────────────────────
+// ── Strategy 10: BSW Tabular Comparison Grid ──────────────────────────────────
+// Handles BSW (Baylor Scott & White) PDFs where the document is a multi-column
+// comparison table: plan codes or descriptive plan names appear as column headers,
+// and benefit rows (deductible, OOP max, copays, premiums) appear as labelled rows.
+//
+// PDF extraction of this format produces text like:
+//   "Plan Code  GHG26P44  SHG26A52  BHG26D60"
+//   "Deductible  $1,000  $2,500  $5,000"
+//   "OOP Max  $5,000  $7,500  $8,150"
+//   ...
+// or with descriptive names:
+//   "BSW Premier Gold 1000  BSW Access Silver 2500  BSW Plus Bronze 5000"
+//   "Individual Deductible  $1,000  $2,500  $5,000"
+//   ...
+function extractFromBSWTabularGrid(text, sourceFile) {
+  // Gate: must mention Baylor Scott & White or "BSW" plan codes, or BSW network names
+  if (!/baylor\s*scott\s*(?:&|and)?\s*white|bsw\s+(?:premier|access|plus)|BSW\s+Health/i.test(text)
+      && !/[PGBS][HP]G\d{2}[A-Z]\d{2,3}/.test(text)) {
+    return [];
+  }
+
+  const lines = text.split('\n');
+  const carrier = 'Baylor Scott & White';
+
+  // Identify a header row: a line that contains 2+ BSW plan codes or 2+ BSW descriptive names
+  const BSW_CODE_RE = /\b([PGBS][HP]G\d{2}[A-Z](?:\d{2,3}|IV))\b/g;
+  const METAL_MAP = { P: 'Platinum', G: 'Gold', S: 'Silver', B: 'Bronze' };
+  const NET_MAP = { H: 'HMO', P: 'PPO' };
+  const SUBNET_MAP = { P: 'BSW Premier', A: 'BSW Access', D: 'BSW Plus' };
+
+  // Extract effective date from the text if present
+  const effMatch = text.match(/Effective\s*(?:Date)?:?\s*(\d{1,2}\/\d{1,2}\/\d{2,4})/i);
+  const effectiveDate = effMatch ? effMatch[1] : null;
+
+  // Find the header row with plan codes
+  let headerLineIdx = -1;
+  let planCodes = [];
+  let planMetals = [];
+  let planNetworks = [];
+  let planSubNetworks = [];
+
+  for (let i = 0; i < Math.min(lines.length, 60); i++) {
+    const line = lines[i];
+    const matches = [];
+    let m;
+    const re = new RegExp(BSW_CODE_RE.source, 'g');
+    while ((m = re.exec(line)) !== null) matches.push(m[1]);
+    if (matches.length >= 2) {
+      headerLineIdx = i;
+      planCodes = matches;
+      for (const code of matches) {
+        planMetals.push(METAL_MAP[code[0]] || null);
+        planNetworks.push(NET_MAP[code[1]] || null);
+        const subM = code.match(/G\d{2}([A-Z])/);
+        planSubNetworks.push(subM ? (SUBNET_MAP[subM[1]] || null) : null);
+      }
+      break;
+    }
+  }
+
+  // If no plan codes found, try descriptive BSW plan names as column headers.
+  // e.g. "BSW Premier Gold 1000  BSW Access Silver 2500  BSW Plus Bronze 5000"
+  // Strategy: split the line by 2+ spaces (column separator) and look for segments
+  // that start with "BSW <Network> <Metal>".  Also handle single-space separation by
+  // using a non-greedy regex that stops before the next "BSW" keyword.
+  if (headerLineIdx === -1) {
+    const BSW_SEGMENT_RE = /^BSW\s+(?:Premier|Access|Plus)\s+(?:Platinum|Gold|Silver|Bronze|HSA)(?:\s+[\w\d]+)?/i;
+    for (let i = 0; i < Math.min(lines.length, 60); i++) {
+      const line = lines[i];
+      // First try splitting by 2+ spaces or tabs (common in tabular PDFs)
+      const segments = line.split(/\t|\s{2,}/).map(s => s.trim()).filter(s => s.length > 0);
+      const nameMatches = segments.filter(s => BSW_SEGMENT_RE.test(s));
+      if (nameMatches.length >= 2) {
+        headerLineIdx = i;
+        planMetals = nameMatches.map(n => {
+          const mm = n.match(/\b(Platinum|Gold|Silver|Bronze)\b/i);
+          return mm ? mm[1].charAt(0).toUpperCase() + mm[1].slice(1).toLowerCase() : null;
+        });
+        planNetworks = nameMatches.map(n => /\bHMO\b/i.test(n) ? 'HMO' : /\bPPO\b/i.test(n) ? 'PPO' : null);
+        planSubNetworks = nameMatches.map(n => {
+          if (/premier/i.test(n)) return 'BSW Premier';
+          if (/access/i.test(n)) return 'BSW Access';
+          if (/plus/i.test(n)) return 'BSW Plus';
+          return null;
+        });
+        // Use the matched name strings as plan "codes" for naming purposes
+        planCodes = nameMatches;
+        break;
+      }
+    }
+  }
+
+  if (headerLineIdx === -1 || planCodes.length < 2) return [];
+
+  const numPlans = planCodes.length;
+
+  // Build plan stubs
+  const planData = planCodes.map((code, idx) => ({
+    id: uuidv4(),
+    carrier,
+    planCode: code,
+    planName: null,   // will be assembled after extraction
+    networkType: planNetworks[idx],
+    metalLevel: planMetals[idx],
+    deductibleIndividual: null, deductibleFamily: null,
+    oopMaxIndividual: null, oopMaxFamily: null,
+    coinsurance: null,
+    copayPCP: null, copaySpecialist: null,
+    copayUrgentCare: null, copayER: null,
+    rxDeductible: null, rxTier1: null, rxTier2: null, rxTier3: null,
+    premiumEE: null, premiumES: null, premiumEC: null, premiumEF: null,
+    effectiveDate,
+    ratingArea: null, underwritingNotes: null,
+    extractionConfidence: 0,
+    sourceFile,
+  }));
+
+  // Helper: extract N dollar amounts from a line (aligned with plan columns)
+  function extractColumnValues(line) {
+    const vals = [];
+    const re = /\$\s*([\d,]+(?:\.\d{1,2})?)/g;
+    let m;
+    while ((m = re.exec(line)) !== null) vals.push(parseMoney(m[1]));
+    return vals;
+  }
+
+  // Helper: extract N percentage values from a line
+  function extractPercentValues(line) {
+    const vals = [];
+    const re = /(\d+)\s*%/g;
+    let m;
+    while ((m = re.exec(line)) !== null) vals.push(parseInt(m[1], 10));
+    return vals;
+  }
+
+  // Helper: assign values from array to planData field if aligned
+  function assignToPlans(vals, field, secondary, secondaryVals) {
+    for (let p = 0; p < numPlans && p < vals.length; p++) {
+      if (vals[p] != null && planData[p][field] == null) planData[p][field] = vals[p];
+    }
+    if (secondary && secondaryVals) {
+      for (let p = 0; p < numPlans && p < secondaryVals.length; p++) {
+        if (secondaryVals[p] != null && planData[p][secondary] == null) planData[p][secondary] = secondaryVals[p];
+      }
+    }
+  }
+
+  // Scan benefit rows starting after the header line
+  for (let i = headerLineIdx + 1; i < lines.length; i++) {
+    const line = lines[i];
+    const lbl = line.toLowerCase();
+
+    // Check for individual/family pair on same line: "$X / $Y  $X / $Y  $X / $Y"
+    const pairRe = /\$([\d,]+)\s*\/\s*\$([\d,]+)/g;
+    const pairs = [];
+    let pm;
+    while ((pm = pairRe.exec(line)) !== null) {
+      pairs.push({ ind: parseMoney(pm[1]), fam: parseMoney(pm[2]) });
+    }
+
+    const vals = extractColumnValues(line);
+    const pcts = extractPercentValues(line);
+
+    if (/deductible/i.test(lbl) && !/rx|pharm|drug/i.test(lbl)) {
+      if (/family/i.test(lbl)) {
+        assignToPlans(vals, 'deductibleFamily', null, null);
+      } else if (pairs.length >= numPlans) {
+        for (let p = 0; p < numPlans; p++) {
+          if (planData[p].deductibleIndividual == null) planData[p].deductibleIndividual = pairs[p].ind;
+          if (planData[p].deductibleFamily == null) planData[p].deductibleFamily = pairs[p].fam;
+        }
+      } else {
+        assignToPlans(vals, 'deductibleIndividual', null, null);
+      }
+    } else if (/out[\s-]*of[\s-]*pocket|oop\s*max|moop/i.test(lbl) || /max(?:imum)?\s*out/i.test(lbl)) {
+      if (/family/i.test(lbl)) {
+        assignToPlans(vals, 'oopMaxFamily', null, null);
+      } else if (pairs.length >= numPlans) {
+        for (let p = 0; p < numPlans; p++) {
+          if (planData[p].oopMaxIndividual == null) planData[p].oopMaxIndividual = pairs[p].ind;
+          if (planData[p].oopMaxFamily == null) planData[p].oopMaxFamily = pairs[p].fam;
+        }
+      } else {
+        assignToPlans(vals, 'oopMaxIndividual', null, null);
+      }
+    } else if (/pcp|primary\s*care|office\s*visit|physician|doctor/i.test(lbl) && !/specialist/i.test(lbl)) {
+      assignToPlans(vals, 'copayPCP', null, null);
+    } else if (/specialist/i.test(lbl)) {
+      assignToPlans(vals, 'copaySpecialist', null, null);
+    } else if (/emergency|er\s*cop/i.test(lbl)) {
+      assignToPlans(vals, 'copayER', null, null);
+    } else if (/urgent\s*care/i.test(lbl)) {
+      assignToPlans(vals, 'copayUrgentCare', null, null);
+    } else if (/coinsurance/i.test(lbl) && pcts.length >= numPlans) {
+      for (let p = 0; p < numPlans && p < pcts.length; p++) {
+        if (planData[p].coinsurance == null) planData[p].coinsurance = `${pcts[p]}%`;
+      }
+    } else if (/rx|pharmacy|drug|prescription/i.test(lbl) && vals.length >= 3) {
+      // Rx tier line: first 3 values assigned to tier 1/2/3
+      for (let p = 0; p < numPlans; p++) {
+        // Heuristic: rx tier values from multi-value line (e.g., "$3/$15/$50/$90" per plan)
+        // If we have exactly 3×numPlans values, split them; otherwise take the first 3 as shared
+        const tierCount = 3;
+        const startIdx = p * tierCount;
+        if (startIdx + 2 < vals.length) {
+          if (planData[p].rxTier1 == null) planData[p].rxTier1 = vals[startIdx];
+          if (planData[p].rxTier2 == null) planData[p].rxTier2 = vals[startIdx + 1];
+          if (planData[p].rxTier3 == null) planData[p].rxTier3 = vals[startIdx + 2];
+        } else if (vals.length >= 3 && numPlans === 1) {
+          if (planData[0].rxTier1 == null) planData[0].rxTier1 = vals[0];
+          if (planData[0].rxTier2 == null) planData[0].rxTier2 = vals[1];
+          if (planData[0].rxTier3 == null) planData[0].rxTier3 = vals[2];
+        }
+      }
+    } else if (/employee\s*only|emp\s*only|\bee\b(?!\+)|^ee\s/i.test(lbl) && !/spouse|child|family/i.test(lbl)) {
+      assignToPlans(vals, 'premiumEE', null, null);
+    } else if (/emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp)|\bes[\b\s]/i.test(lbl)) {
+      assignToPlans(vals, 'premiumES', null, null);
+    } else if (/emp(?:loyee)?\s*[\+\/&]\s*(?:child|ch)|\bec[\b\s]/i.test(lbl)) {
+      assignToPlans(vals, 'premiumEC', null, null);
+    } else if (/family|\bef[\b\s]/i.test(lbl) && /\$/.test(line) && !/deductible|oop|max/i.test(lbl)) {
+      assignToPlans(vals, 'premiumEF', null, null);
+    }
+  }
+
+  // Build plan names from extracted metadata
+  for (let p = 0; p < numPlans; p++) {
+    const metal = planData[p].metalLevel;
+    const network = planData[p].networkType;
+    const subNetwork = planSubNetworks[p];
+    const ded = planData[p].deductibleIndividual;
+    const code = planData[p].planCode;
+
+    let name = '';
+    if (subNetwork) name += subNetwork + ' ';
+    if (metal) name += metal + ' ';
+    if (network) name += network + ' ';
+    if (ded != null) name += `$${ded.toLocaleString()} Ded`;
+    name = name.trim();
+
+    // Fall back to the plan code if we couldn't build a name from metadata
+    if (!name && code) name = code;
+    if (!name) name = `BSW Plan ${p + 1}`;
+
+    planData[p].planName = name;
+  }
+
+  // Score and filter: only include plans with at least 2 extracted fields
+  const validPlans = planData.filter(p => {
+    const FIELDS = ['deductibleIndividual', 'oopMaxIndividual', 'copayPCP', 'copaySpecialist',
+                    'copayER', 'premiumEE', 'premiumES', 'premiumEC', 'premiumEF'];
+    const count = FIELDS.filter(f => p[f] != null).length;
+    p.extractionConfidence = Math.min(1, 0.35 + count * 0.07);
+    return count >= 2;
+  });
+
+  if (validPlans.length < 2) return [];
+  console.log(`[BSW TABULAR] Extracted ${validPlans.length} plans from BSW tabular grid`);
+  return validPlans;
+}
+
+
 // If the same benefit keyword (e.g., "deductible") appears multiple times in the
 // text, each time followed by a dollar amount, that likely means the PDF text was
 // extracted column-by-column (one plan at a time).  Each Nth occurrence of each
@@ -1681,7 +1990,8 @@ function enrichPlansFromText(plans, fullText) {
 
     const raw = firstMatch(fullText, patterns);
     if (raw == null) continue;
-    const val = field === 'coinsurance' ? raw : parseMoney(raw);
+    // For coinsurance, append % if not already present (captured group is digits-only)
+    const val = field === 'coinsurance' ? (String(raw).endsWith('%') ? raw : `${raw}%`) : parseMoney(raw);
     if (val == null) continue;
 
     // Apply to all plans that are missing this field
@@ -1773,6 +2083,7 @@ function normalizeCarrier(raw) {
   const up = raw.replace(/\s+/g, ' ').trim();
   if (/bcbs|blue\s*cross/i.test(up)) return 'BCBS';
   if (/united\s*health/i.test(up)) return 'UnitedHealthcare';
+  if (/baylor\s*scott/i.test(up)) return 'Baylor Scott & White';
   return up.charAt(0).toUpperCase() + up.slice(1);
 }
 
@@ -1928,6 +2239,25 @@ function extractFromRateTable(lines, sourceFile) {
 function findPlanNamesInLine(line) {
   const plans = [];
   const PLAN_KW = /\b(HMO|PPO|EPO|HDHP|HSA|Gold|Silver|Bronze|Platinum|Plus|Select|Choice|Value|Basic|Premier|Standard|Preferred|Essential|Core)\b/i;
+
+  // ── Approach 0: BSW plan code pattern ([PGBS][HP]G\d{2}[A-Z]\d{2,3})
+  // e.g. "GHG26P44  SHG26A52  BHG26D60" or "GHG26P44SHG26A52BHG26D60"
+  const BSW_CODE_RE = /\b([PGBS][HP]G\d{2}[A-Z](?:\d{2,3}|IV))\b/g;
+  const bswMatches = [];
+  let bm;
+  while ((bm = BSW_CODE_RE.exec(line)) !== null) {
+    bswMatches.push(bm[1]);
+  }
+  if (bswMatches.length >= 2) {
+    const METAL_MAP = { P: 'Platinum', G: 'Gold', S: 'Silver', B: 'Bronze' };
+    const NET_MAP = { H: 'HMO', P: 'PPO' };
+    for (const code of bswMatches) {
+      const metal = METAL_MAP[code[0]] || null;
+      const network = NET_MAP[code[1]] || null;
+      plans.push({ name: code, network, metal });
+    }
+    return plans;
+  }
 
   // ── Approach 1: Split by tabs or 2+ spaces (common in pdf-parse table output)
   const segments = line.split(/\t|\s{2,}/).map(s => s.trim()).filter(s => s.length > 3 && s.length < 80);
