@@ -331,7 +331,7 @@ async function extractWithLLM(text, sourceFile) {
   if (!apiKey) return null; // No key = skip LLM strategy
 
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-  const client = new OpenAI({ apiKey, timeout: 25000 });
+  const client = new OpenAI({ apiKey, timeout: 55000 });
 
   // Truncate to fit context window (reserve ~4K for prompt + response structure)
   // gpt-4o-mini: 128K context; gpt-4o: 128K context
@@ -648,6 +648,7 @@ async function extractPlanFromText(text, sourceFile) {
   // ── Strategy 13: LLM Universal Extractor ──────────────────────────────────
   // Smart fallback: only calls the LLM when regex strategies produced poor results.
   // This avoids adding 10-30s of latency when regex already found good data.
+  let llmStatus = 'no API key';
   try {
     if (process.env.OPENAI_API_KEY) {
       const bestRegexScore = candidates.length > 0
@@ -659,17 +660,25 @@ async function extractPlanFromText(text, sourceFile) {
       // Only call LLM if: no plans found, or best regex score is weak (< 20 = few plans with few fields)
       if (bestRegexPlans === 0 || bestRegexScore < 20) {
         console.log(`[LLM] Regex best: ${bestRegexPlans} plans, score=${bestRegexScore.toFixed(1)} — invoking LLM fallback`);
+        llmStatus = 'invoked';
         const llmPlans = await extractWithLLM(text, sourceFile);
         if (llmPlans && llmPlans.length > 0) {
           const score = scoreStrategyResult(llmPlans) + 0.1;
           console.log(`[EXTRACT] Strategy 13 (LLM universal): ${llmPlans.length} plans, score=${score}`);
           candidates.push({ name: 'LLM universal', plans: llmPlans, score });
+          llmStatus = `success: ${llmPlans.length} plans`;
+        } else {
+          llmStatus = 'invoked but returned 0 plans';
         }
       } else {
+        llmStatus = `skipped (regex score=${bestRegexScore.toFixed(1)})`;
         console.log(`[LLM] Regex found ${bestRegexPlans} plans with score=${bestRegexScore.toFixed(1)} — skipping LLM`);
       }
     }
-  } catch (e) { console.log(`[EXTRACT] Strategy 13 error: ${e.message}`); }
+  } catch (e) {
+    llmStatus = `error: ${e.message}`;
+    console.log(`[EXTRACT] Strategy 13 error: ${e.message}`);
+  }
 
   // ── Pick the best strategy by quality score ─────────────────────────────
   let plans = [];
@@ -689,6 +698,7 @@ async function extractPlanFromText(text, sourceFile) {
       winnerScore: best.score,
       allCandidates: candidates.map(c => ({ name: c.name, plans: c.plans.length, score: c.score })),
       planNames: best.plans.map(p => p.planName),
+      llmStatus,
     };
   }
 
