@@ -158,7 +158,7 @@ const upload = multer({
 // ── Auth middleware (disabled – internal tool) ───────────────────────────────
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'bcbs-uhc-strategy14-v5', strategies: 14 }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'bcbs-uhc-strategy14-v6', strategies: 14 }));
 
 // ── Debug: last extraction info ───────────────────────────────────────────────
 app.get('/debug/lastextract', (_req, res) => {
@@ -2332,7 +2332,7 @@ function extractFromBCBSBenefitSummary(text, sourceFile) {
 //   "Navigate", "Compass Rose", "Options PPO", "Select Plus"
 function extractFromUHCProposal(text, sourceFile) {
   // Gate: must look like a UHC document
-  const isUHC = /United\s*Health(?:care)?|(?<!\w)UHC(?!\w)|Choice\s*Plus|Navigate\s*(?:HMO|PPO|EPO)|Options\s*PPO|Select\s*Plus|Compass\s*Rose/i.test(text) ||
+  const isUHC = /United\s*Health(?:care)?|(?<!\w)UHC(?!\w)|Choice\s*Plus|INS[\s-]*Choice|Navigate\s*(?:HMO|PPO|EPO)|Options\s*PPO|Select\s*Plus|Compass\s*Rose/i.test(text) ||
                 /uhc|united/i.test(sourceFile || '');
   if (!isUHC) return [];
 
@@ -2345,8 +2345,8 @@ function extractFromUHCProposal(text, sourceFile) {
                    text.match(/Eff(?:ective)?[:\s]*(\d{1,2}\/\d{1,2}\/\d{2,4})/i);
   const effectiveDate = effMatch ? effMatch[1] : null;
 
-  // UHC plan name patterns
-  const UHC_PLAN_NAME_RE = /(?:Choice\s*Plus|Navigate|Options|Select\s*Plus|Compass\s*Rose|UHC|United)\s+(?:PPO|HMO|EPO|HDHP|HSA)\s*(?:Platinum|Gold|Silver|Bronze)?(?:\s+\d+)?/gi;
+  // UHC plan name patterns — includes INS-Choice (Insured Choice) product line
+  const UHC_PLAN_NAME_RE = /(?:Choice\s*Plus|Navigate|Options|Select\s*Plus|Compass\s*Rose|UHC|United)\s+(?:PPO|HMO|EPO|HDHP|HSA)\s*(?:Platinum|Gold|Silver|Bronze)?(?:\s+\d+)?|INS[\s-]*Choice(?:\s+(?:PPO|HMO|EPO|HDHP|HSA))?(?:\s*(?:Platinum|Gold|Silver|Bronze))?(?:\s+\$?[\d,]+)?/gi;
 
   // Plan name detection
   let planNames = [];
@@ -2392,6 +2392,53 @@ function extractFromUHCProposal(text, sourceFile) {
         }
         break;
       }
+    }
+  }
+
+  // Approach 3: Count dollar-value columns in benefit rows to infer plan count.
+  // Some UHC PDFs (e.g. INS-Choice) list the plan name once per column on a line
+  // that might not be caught by Approach 1/2 (e.g. plan names on separate lines,
+  // or a single plan-name header that PDF extraction puts on one line).
+  // We detect the plan count from the most common number of dollar values per row
+  // in lines that look like benefit data (deductible, OOP, premium, copay rows).
+  if (headerLineIdx === -1 || planNames.length < 2) {
+    planNames = [];
+    planNetworks = [];
+    planMetals = [];
+    headerLineIdx = -1;
+
+    // Scan the first 80 lines for benefit-like rows and count $ values per row
+    const BENEFIT_LBL = /deductible|out[\s-]*of[\s-]*pocket|oop|copay|coinsurance|premium|employee|family|pcp|specialist|emergency|urgent|generic|brand|tier/i;
+    const dollarCounts = {};
+    let lastBenefitLine = -1;
+    for (let i = 0; i < Math.min(lines.length, 80); i++) {
+      const line = lines[i];
+      if (!BENEFIT_LBL.test(line)) continue;
+      const dv = [];
+      const re = /\$\s*([\d,]+(?:\.\d{1,2})?)/g;
+      let m;
+      while ((m = re.exec(line)) !== null) dv.push(m[0]);
+      if (dv.length >= 2) {
+        dollarCounts[dv.length] = (dollarCounts[dv.length] || 0) + 1;
+        if (headerLineIdx === -1) headerLineIdx = Math.max(0, i - 1);
+        lastBenefitLine = i;
+      }
+    }
+    // Pick the most frequent column count as numPlans
+    let bestCount = 0, bestFreq = 0;
+    for (const [cnt, freq] of Object.entries(dollarCounts)) {
+      if (freq > bestFreq) { bestFreq = freq; bestCount = parseInt(cnt, 10); }
+    }
+    if (bestCount >= 2 && bestFreq >= 2) {
+      // Try to find a plan name from the text (look for INS-Choice or other patterns)
+      const nameMatch = text.match(/INS[\s-]*Choice|Choice\s*Plus|Navigate|Options|Select\s*Plus/i);
+      const baseName = nameMatch ? nameMatch[0].replace(/\s+/g, ' ').trim() : 'Plan';
+      for (let p = 0; p < bestCount; p++) {
+        planNames.push(baseName);
+        planNetworks.push(null);
+        planMetals.push(null);
+      }
+      console.log(`[UHC] Approach 3: inferred ${bestCount} plans from dollar-value column counts (${bestFreq} matching rows)`);
     }
   }
 
@@ -2549,6 +2596,29 @@ function extractFromUHCProposal(text, sourceFile) {
     p.extractionConfidence = Math.min(1, 0.4 + count * 0.07);
     return count >= 2;
   });
+
+  // Differentiate plans that have the same name by appending deductible or index
+  const nameCount = {};
+  for (const p of validPlans) nameCount[p.planName] = (nameCount[p.planName] || 0) + 1;
+  for (const [name, count] of Object.entries(nameCount)) {
+    if (count < 2) continue;
+    const dupes = validPlans.filter(p => p.planName === name);
+    for (const p of dupes) {
+      if (p.deductibleIndividual != null) {
+        p.planName = `${name} $${p.deductibleIndividual.toLocaleString()}`;
+      }
+    }
+    // If deductible didn't differentiate (all same or all null), use index
+    const nameCountAfter = {};
+    for (const p of dupes) nameCountAfter[p.planName] = (nameCountAfter[p.planName] || 0) + 1;
+    for (const [n2, c2] of Object.entries(nameCountAfter)) {
+      if (c2 < 2) continue;
+      let idx = 1;
+      for (const p of dupes) {
+        if (p.planName === n2) p.planName = `${name} Plan ${idx++}`;
+      }
+    }
+  }
 
   if (validPlans.length < 2) return [];
   console.log(`[UHC] Extracted ${validPlans.length} plans from UHC proposal`);
@@ -3055,7 +3125,10 @@ function deduplicatePlans(plans) {
       // Don't merge if both plans have distinct premium values (they are different plans)
       const bothHavePremiums = plan.premiumEE != null && existing.premiumEE != null;
       const premiumsDiffer = bothHavePremiums && Math.abs(plan.premiumEE - existing.premiumEE) > 0.01;
-      if (nameMatch && carrierMatch && !premiumsDiffer) {
+      // Also don't merge if both plans have distinct deductible values
+      const bothHaveDed = plan.deductibleIndividual != null && existing.deductibleIndividual != null;
+      const dedDiffer = bothHaveDed && Math.abs(plan.deductibleIndividual - existing.deductibleIndividual) > 0.01;
+      if (nameMatch && carrierMatch && !premiumsDiffer && !dedDiffer) {
         mergePlanInto(existing, plan);
         merged = true;
         break;
