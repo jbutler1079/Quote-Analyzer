@@ -8,6 +8,7 @@ const { v4: uuidv4 } = require('uuid');
 const pdfParse = require('pdf-parse');
 const ExcelJS = require('exceljs');
 const PptxGenJS = require('pptxgenjs');
+const OpenAI = require('openai');
 
 const app = express();
 app.use(cors());
@@ -158,7 +159,7 @@ const upload = multer({
 // ── Auth middleware (disabled – internal tool) ───────────────────────────────
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'uhc-strategy12-v1', strategies: 12 }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'llm-strategy13-v1', strategies: 13, llmEnabled: !!process.env.OPENAI_API_KEY }));
 
 // ── Debug: last extraction info ───────────────────────────────────────────────
 app.get('/debug/lastextract', (_req, res) => {
@@ -167,11 +168,11 @@ app.get('/debug/lastextract', (_req, res) => {
 });
 
 // ── Debug: extract plans from raw text (for testing without PDF) ──────────────
-app.post('/debug/extract', (req, res) => {
+app.post('/debug/extract', async (req, res) => {
   try {
     const { text, sourceFile } = req.body;
     if (!text) return res.status(400).json({ error: 'text required' });
-    const plans = extractPlanFromText(text, sourceFile || 'debug-input.txt');
+    const plans = await extractPlanFromText(text, sourceFile || 'debug-input.txt');
     res.json({ plans, count: plans.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -322,7 +323,162 @@ const KNOWN_CARRIERS = [
 ];
 const CARRIER_PATTERN = new RegExp('\\b(' + KNOWN_CARRIERS.join('|') + ')\\b', 'i');
 
-function extractPlanFromText(text, sourceFile) {
+// ── Strategy 13: LLM Universal Extractor ──────────────────────────────────────
+// Uses OpenAI (GPT-4o-mini by default) to extract plan data from ANY carrier PDF
+// format. Only runs when OPENAI_API_KEY environment variable is set.
+async function extractWithLLM(text, sourceFile) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null; // No key = skip LLM strategy
+
+  const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  const client = new OpenAI({ apiKey });
+
+  // Truncate to fit context window (reserve ~4K for prompt + response structure)
+  // gpt-4o-mini: 128K context; gpt-4o: 128K context
+  const MAX_TEXT_CHARS = 100000;
+  const inputText = text.length > MAX_TEXT_CHARS
+    ? text.substring(0, MAX_TEXT_CHARS) + '\n\n[... truncated ...]'
+    : text;
+
+  const systemPrompt = `You are an insurance benefits extraction engine. Extract ALL health insurance plan options from the provided document text.
+
+For EACH plan, return a JSON object with these exact fields (use null if not found):
+- planName: string — Plan display name (e.g., "Gold PPO 1500", "Choice Plus HSA")
+- planCode: string — Internal plan code if present (e.g., "EI2J", "AAG1")
+- carrier: string — Insurance carrier (e.g., "UnitedHealthcare", "Aetna", "Blue Cross Blue Shield")
+- networkType: string — HMO, PPO, EPO, POS, HDHP, or null
+- deductibleIndividual: number — In-network individual deductible in dollars
+- deductibleFamily: number — In-network family deductible in dollars
+- oopMaxIndividual: number — In-network individual out-of-pocket maximum in dollars
+- oopMaxFamily: number — In-network family out-of-pocket maximum in dollars
+- coinsurance: string — Coinsurance percentage (e.g., "20%")
+- copayPCP: number — Primary care copay in dollars
+- copaySpecialist: number — Specialist copay in dollars
+- copayUrgentCare: number — Urgent care copay in dollars (null if not listed)
+- copayER: number — Emergency room copay in dollars
+- rxTier1: string — Generic Rx cost (e.g., "$10" or "$10/$20/$30")
+- rxTier2: string — Preferred brand Rx cost
+- rxTier3: string — Non-preferred Rx cost
+- premiumEE: number — Employee-only monthly premium in dollars
+- premiumES: number — Employee + Spouse monthly premium in dollars
+- premiumEC: number — Employee + Child(ren) monthly premium in dollars
+- premiumEF: number — Employee + Family monthly premium in dollars
+- effectiveDate: string — Plan effective date if found (e.g., "05/01/2026")
+- hsaEligible: boolean — Whether plan is HSA-eligible
+- product: string — Product line/family if stated (e.g., "Insurance Choice", "Navigate")
+
+CRITICAL RULES:
+- Extract EVERY plan option in the document, including alternates and variations
+- Premiums must be monthly amounts. If the document shows per-pay-period amounts, note that but still report as-is.
+- Dollar amounts should be numbers without $ sign (e.g., 1500 not "$1,500")
+- Return ONLY the JSON array, no explanatory text
+- If the document contains plan comparison tables, extract each column as a plan
+- If the document contains "Medical Plan Alternates" pages, extract every alternate plan listed`;
+
+  const userPrompt = `Extract all insurance plans from this document (source file: "${sourceFile}"):\n\n${inputText}`;
+
+  console.log(`[LLM] Sending ${inputText.length} chars to ${model} for extraction...`);
+  const startTime = Date.now();
+
+  try {
+    const completion = await client.chat.completions.create({
+      model,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0,
+      max_tokens: 16000,
+    });
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const content = completion.choices[0]?.message?.content;
+    if (!content) {
+      console.log(`[LLM] Empty response after ${elapsed}s`);
+      return [];
+    }
+
+    console.log(`[LLM] Received response in ${elapsed}s (${content.length} chars)`);
+
+    const parsed = JSON.parse(content);
+    // The response might be { plans: [...] } or just [...]
+    const rawPlans = Array.isArray(parsed) ? parsed : (parsed.plans || parsed.data || []);
+
+    if (!Array.isArray(rawPlans) || rawPlans.length === 0) {
+      console.log(`[LLM] No plans in response`);
+      return [];
+    }
+
+    // Normalize LLM output into our standard plan schema
+    const plans = rawPlans.map(p => ({
+      id: uuidv4(),
+      carrier: p.carrier || null,
+      planName: p.planName || p.plan_name || 'Unknown Plan',
+      planCode: p.planCode || p.plan_code || null,
+      networkType: p.networkType || p.network_type || null,
+      metalLevel: p.metalLevel || p.metal_level || null,
+      deductibleIndividual: toNum(p.deductibleIndividual ?? p.deductible_individual),
+      deductibleFamily: toNum(p.deductibleFamily ?? p.deductible_family),
+      oopMaxIndividual: toNum(p.oopMaxIndividual ?? p.oop_max_individual),
+      oopMaxFamily: toNum(p.oopMaxFamily ?? p.oop_max_family),
+      coinsurance: p.coinsurance || null,
+      copayPCP: toNum(p.copayPCP ?? p.copay_pcp),
+      copaySpecialist: toNum(p.copaySpecialist ?? p.copay_specialist),
+      copayUrgentCare: toNum(p.copayUrgentCare ?? p.copay_urgent_care),
+      copayER: toNum(p.copayER ?? p.copay_er),
+      rxDeductible: toNum(p.rxDeductible ?? p.rx_deductible),
+      rxTier1: p.rxTier1 || p.rx_tier1 || null,
+      rxTier2: p.rxTier2 || p.rx_tier2 || null,
+      rxTier3: p.rxTier3 || p.rx_tier3 || null,
+      premiumEE: toNum(p.premiumEE ?? p.premium_ee),
+      premiumES: toNum(p.premiumES ?? p.premium_es),
+      premiumEC: toNum(p.premiumEC ?? p.premium_ec),
+      premiumEF: toNum(p.premiumEF ?? p.premium_ef),
+      effectiveDate: p.effectiveDate || p.effective_date || null,
+      product: p.product || null,
+      hsaEligible: p.hsaEligible ?? p.hsa_eligible ?? false,
+      ratingArea: null,
+      underwritingNotes: null,
+      extractionConfidence: 0,
+      sourceFile,
+    }));
+
+    // Calculate confidence per plan
+    const BENEFIT_FIELDS = [
+      'deductibleIndividual', 'deductibleFamily', 'oopMaxIndividual', 'oopMaxFamily',
+      'copayPCP', 'copaySpecialist', 'copayER',
+      'premiumEE', 'premiumES', 'premiumEC', 'premiumEF',
+    ];
+    for (const plan of plans) {
+      const found = BENEFIT_FIELDS.filter(f => plan[f] != null).length;
+      plan.extractionConfidence = Math.min(1, 0.3 + (found * 0.07));
+    }
+
+    const usage = completion.usage;
+    console.log(`[LLM] Extracted ${plans.length} plans via ${model} in ${elapsed}s` +
+      (usage ? ` (${usage.prompt_tokens}+${usage.completion_tokens} tokens)` : ''));
+
+    return plans;
+  } catch (err) {
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.error(`[LLM] Error after ${elapsed}s: ${err.message}`);
+    return [];
+  }
+}
+
+// Helper: coerce to number, return null if invalid
+function toNum(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return v;
+  if (typeof v === 'string') {
+    const n = parseFloat(v.replace(/[$,]/g, ''));
+    return isNaN(n) ? null : n;
+  }
+  return null;
+}
+
+async function extractPlanFromText(text, sourceFile) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   const fullText = text;
 
@@ -488,6 +644,19 @@ function extractPlanFromText(text, sourceFile) {
       candidates.push({ name: 'UHC quote grid', plans: uhcPlans, score });
     }
   } catch (e) { console.log(`[EXTRACT] Strategy 12 error: ${e.message}`); }
+
+  // ── Strategy 13: LLM Universal Extractor ──────────────────────────────────
+  // Runs in parallel with regex strategies. Only active when OPENAI_API_KEY is set.
+  try {
+    if (process.env.OPENAI_API_KEY) {
+      const llmPlans = await extractWithLLM(text, sourceFile);
+      if (llmPlans && llmPlans.length > 0) {
+        const score = scoreStrategyResult(llmPlans) + 0.1;
+        console.log(`[EXTRACT] Strategy 13 (LLM universal): ${llmPlans.length} plans, score=${score}`);
+        candidates.push({ name: 'LLM universal', plans: llmPlans, score });
+      }
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 13 error: ${e.message}`); }
 
   // ── Pick the best strategy by quality score ─────────────────────────────
   let plans = [];
@@ -1772,6 +1941,216 @@ function extractFromUHCQuote(text, sourceFile) {
 
   if (allPlans.length > 0) {
     console.log(`[UHC] Extracted ${allPlans.length} plans from ${ratePages.length} rate pages`);
+  }
+
+  // ── Parse "Medical Plan Alternates" (MPE) pages ──
+  // These are dense tabular pages listing alternate plans for each product line.
+  // Format per entry (spans ~8-12 lines):
+  //   <number><planCode>        e.g. "1EIZ4" or "24EIXU"
+  //   <network type>            e.g. "EPO \nPROformance" or "POS \nPremier"
+  //   <copays+benefits>         concatenated copays, deductibles, OOP, rates
+  //   Final rates line ends with: $EE$ES$EC$EF<variance>%
+  // Continuation pages (no "Medical Plan Alternates" header) have same format.
+  const mpePages = pageBlocks.filter(b =>
+    /MPE-\d+/i.test(b.substring(0, 200)) &&
+    !/Option\s+\d+/i.test(b.substring(0, 600))
+  );
+
+  if (mpePages.length > 0) {
+    console.log(`[UHC] Found ${mpePages.length} MPE alternate page(s)`);
+    let mpeCount = 0;
+    let lastProductFamily = null; // For continuation pages that lack header
+    // Track plan codes from rate pages to avoid duplicating base plans
+    const ratePageCodes = new Set(allPlans.map(p => p.planCode));
+
+    for (const page of mpePages) {
+      const lines = page.split('\n');
+
+      // Extract product family from header: "Medical Plan Alternates for Insurance Choice, ..."
+      let productFamily = null;
+      const famMatch = page.match(/Medical Plan Alternates for ([^,*]+)/i);
+      if (famMatch) {
+        productFamily = famMatch[1].trim();
+        lastProductFamily = productFamily;
+      } else {
+        productFamily = lastProductFamily; // Continuation page inherits
+      }
+
+      // Find plan entries: lines starting with <number><alphaCode> (e.g. "1EIZ4", "24EIXU")
+      // or just <number>\n<code> for Surest-style entries
+      const entryStarts = [];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        // Match: digit(s) immediately followed by plan code (letter + alphanumerics)
+        const em = line.match(/^(\d+)([A-Z][A-Z0-9_]+)$/i);
+        if (em) {
+          entryStarts.push({ lineIdx: i, seqNum: parseInt(em[1], 10), planCode: em[2] });
+          continue;
+        }
+        // Surest-style: just a number on one line, then Surest code wrapped across next lines
+        if (/^\d+$/.test(line) && i + 1 < lines.length) {
+          const nextLine = lines[i + 1].trim();
+          // Surest codes wrap: "Surest_AP1500_(" on one line, "2025)" on next
+          if (/^Surest_/i.test(nextLine)) {
+            // Collect the full code by joining lines until we hit the description line
+            let fullCode = '';
+            for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+              const part = lines[j].trim();
+              if (/^Surest\s+\d{4}/i.test(part) && fullCode) break; // Description line starts
+              fullCode += part;
+            }
+            // Clean: "Surest_AP1500_(2025)" → "Surest_AP1500_(2025)"
+            fullCode = fullCode.replace(/\s+/g, '');
+            entryStarts.push({ lineIdx: i, seqNum: parseInt(line, 10), planCode: fullCode });
+          }
+        }
+      }
+
+      for (let e = 0; e < entryStarts.length; e++) {
+        const entry = entryStarts[e];
+        const startLine = entry.lineIdx;
+        const endLine = e + 1 < entryStarts.length
+          ? entryStarts[e + 1].lineIdx
+          : Math.min(startLine + 20, lines.length);
+
+        // Gather all text for this entry
+        const entryLines = lines.slice(startLine, endLine).map(l => l.trim()).filter(Boolean);
+        const entryText = entryLines.join(' ');
+
+        // Extract network type from lines after the plan code line
+        let networkType = null;
+        let planDescription = '';
+        for (let j = 1; j < Math.min(4, entryLines.length); j++) {
+          const el = entryLines[j];
+          if (/^\$/.test(el) || /D&C|POD|Ded\+/i.test(el)) break;
+          planDescription += ' ' + el;
+        }
+        planDescription = planDescription.trim()
+          .replace(/PROforman\s+ce/gi, 'PROformance');
+        if (/\bEPO\b/i.test(planDescription)) networkType = 'EPO';
+        else if (/\bHMO\b/i.test(planDescription)) networkType = 'HMO';
+        else if (/\bPOS\b/i.test(planDescription)) networkType = 'POS';
+        else if (/\bPPO\b/i.test(planDescription)) networkType = 'PPO';
+        else if (/\bSurest\b/i.test(planDescription) || /Surest/i.test(entry.planCode)) networkType = 'Surest';
+
+        // Extract the 4 premium rates — they appear as 4 consecutive $ amounts
+        // near the end of the entry, just before the variance percentage
+        // Pattern: $EE$ES$EC$EF followed by optional -X.X% or 0%
+        const allAmounts = [...entryText.matchAll(/\$([\d,]+\.\d{2})/g)];
+
+        let premiumEE = null, premiumES = null, premiumEC = null, premiumEF = null;
+        // The last 4 dollar amounts with cents are the premiums (EE, ES, EC, EF)
+        if (allAmounts.length >= 4) {
+          const last4 = allAmounts.slice(-4);
+          premiumEE = parseMoney(last4[0][1]);
+          premiumES = parseMoney(last4[1][1]);
+          premiumEC = parseMoney(last4[2][1]);
+          premiumEF = parseMoney(last4[3][1]);
+        }
+
+        // Extract deductible — look for "$X,XXX / $Y,YYY" pattern (ind / fam)
+        // Require spaces around / to avoid matching copay splits like $70/$100
+        // Use strict comma-formatted number pattern to avoid capturing trailing digits (e.g. 75%)
+        let dedIndividual = null, dedFamily = null;
+        const dedMatches = [...entryText.matchAll(/\$(\d{1,3}(?:,\d{3})*)\s+\/\s+\$(\d{1,3}(?:,\d{3})*)/g)];
+        if (dedMatches.length > 0) {
+          // First ind/fam pair is in-network deductible
+          dedIndividual = parseMoney(dedMatches[0][1]);
+          dedFamily = parseMoney(dedMatches[0][2]);
+        }
+
+        // Extract OOP — second ind/fam pair (or after "N/A" gap for out-of-network)
+        let oopIndividual = null, oopFamily = null;
+        // In-network OOP is typically the 2nd pair, but for HMO plans there may be
+        // fewer pairs. Use a heuristic: last pair before the premiums.
+        if (dedMatches.length >= 2) {
+          // Find the pair that's the in-network OOP (2nd pair usually)
+          oopIndividual = parseMoney(dedMatches[1][1]);
+          oopFamily = parseMoney(dedMatches[1][2]);
+        }
+
+        // Extract coinsurance — percentage between deductible and OOP data
+        let coinsurance = null;
+        const coinsMatch = entryText.match(/(\d+)%\s*\$/);
+        if (coinsMatch && parseInt(coinsMatch[1], 10) <= 100) {
+          coinsurance = `${coinsMatch[1]}%`;
+        }
+
+        // Extract copays — PCP is first dollar amount, SPC is second
+        let copayPCP = null, copaySpecialist = null, copayER = null;
+        // The copay amounts appear early in the entry after network description
+        // Look for small dollar amounts (< $500) before deductible
+        const copayLine = entryLines.slice(1, 5).join(' ');
+        const smallAmts = [...copayLine.matchAll(/\$(\d+)/g)];
+        if (smallAmts.length >= 2) {
+          const v1 = parseInt(smallAmts[0][1], 10);
+          const v2 = parseInt(smallAmts[1][1], 10);
+          if (v1 < 200) copayPCP = v1;
+          if (v2 < 200) copaySpecialist = v2;
+        }
+        // ER copay — look for a value after "ER" or the 6th small amount
+        const erMatch = entryText.match(/ER\s*\$(\d+)/i);
+        if (erMatch) copayER = parseInt(erMatch[1], 10);
+        else if (smallAmts.length >= 6) {
+          const erVal = parseInt(smallAmts[5][1], 10);
+          if (erVal < 2000) copayER = erVal;
+        }
+
+        // Determine HSA from plan code or description
+        const isHSA = /HSA/i.test(planDescription) || /HSA/i.test(entry.planCode);
+
+        // Derive product from family header or fallback
+        let product = productFamily || null;
+
+        if (premiumEE != null) {
+          // Skip plans that already exist from rate pages (base plans appear in both)
+          if (ratePageCodes.has(entry.planCode)) continue;
+
+          const plan = {
+            id: uuidv4(),
+            carrier,
+            planName: `${entry.planCode} (${planDescription || networkType || 'Unknown'})`,
+            planCode: entry.planCode,
+            networkType: isHSA ? (networkType || 'HSA') : networkType,
+            metalLevel: null,
+            deductibleIndividual: dedIndividual,
+            deductibleFamily: dedFamily,
+            oopMaxIndividual: oopIndividual,
+            oopMaxFamily: oopFamily,
+            coinsurance,
+            copayPCP, copaySpecialist,
+            copayUrgentCare: null,
+            copayER,
+            rxDeductible: null, rxTier1: null, rxTier2: null, rxTier3: null,
+            premiumEE, premiumES, premiumEC, premiumEF,
+            effectiveDate,
+            product,
+            hsaEligible: isHSA,
+            ratingArea: null,
+            underwritingNotes: null,
+            extractionConfidence: 0,
+            sourceFile,
+          };
+
+          const fields = [plan.deductibleIndividual, plan.deductibleFamily,
+                          plan.oopMaxIndividual, plan.oopMaxFamily,
+                          plan.copayPCP, plan.copaySpecialist, plan.copayER,
+                          plan.premiumEE, plan.premiumES, plan.premiumEC, plan.premiumEF];
+          const found = fields.filter(v => v != null).length;
+          plan.extractionConfidence = Math.min(1, 0.3 + (found * 0.07));
+
+          allPlans.push(plan);
+          mpeCount++;
+        }
+      }
+    }
+    if (mpeCount > 0) {
+      console.log(`[UHC] Extracted ${mpeCount} alternate plans from ${mpePages.length} MPE pages`);
+    }
+  }
+
+  if (allPlans.length > 0) {
+    console.log(`[UHC] Total: ${allPlans.length} plans (rate pages + alternates)`);
   }
   return allPlans;
 }
@@ -3498,7 +3877,7 @@ app.post('/parse', async (req, res) => {
           const data = await pdfParse(file.buffer);
           console.log(`[PARSE] PDF "${file.originalname}" — extracted ${data.text.length} chars, ${data.text.split('\n').length} lines`);
           console.log(`[PARSE] First 2000 chars:\n${data.text.substring(0, 2000)}`);
-          const plans = extractPlanFromText(data.text, file.originalname);
+          const plans = await extractPlanFromText(data.text, file.originalname);
           console.log(`[PARSE] Extracted ${plans.length} plans from "${file.originalname}":`, plans.map(p => ({ name: p.planName, ded: p.deductibleIndividual, oop: p.oopMaxIndividual, pcp: p.copayPCP, eeP: p.premiumEE })));
           if (plans.length === 0) {
             warnings.push(`No plans extracted from ${file.originalname} — check file formatting`);
