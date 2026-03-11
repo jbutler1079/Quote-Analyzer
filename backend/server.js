@@ -24,6 +24,7 @@ const PAY_PERIODS_PER_MONTH = {
 };
 
 // ── In-memory store ──────────────────────────────────────────────────────────
+let lastLlmDebug = null; // Store last LLM call details for debugging
 const caseStore = new Map(); // caseId → { files, plans, census, recommendations }
 let lastExtractDebug = null; // Stores last extraction debug info
 
@@ -165,6 +166,12 @@ app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'llm-strateg
 app.get('/debug/lastextract', (_req, res) => {
   if (!lastExtractDebug) return res.status(404).json({ error: 'No extraction yet' });
   res.json(lastExtractDebug);
+});
+
+// ── Debug: last LLM call details ──────────────────────────────────────────────
+app.get('/debug/lastllm', (_req, res) => {
+  if (!lastLlmDebug) return res.status(404).json({ error: 'No LLM call yet' });
+  res.json(lastLlmDebug);
 });
 
 // ── Debug: extract plans from raw text (for testing without PDF) ──────────────
@@ -396,10 +403,24 @@ CRITICAL RULES:
     const content = completion.choices[0]?.message?.content;
     if (!content) {
       console.log(`[LLM] Empty response after ${elapsed}s`);
+      lastLlmDebug = { timestamp: new Date().toISOString(), sourceFile, model, elapsed: parseFloat(elapsed), error: 'empty response', inputChars: inputText.length, inputPreview: inputText.substring(0, 3000) };
       return [];
     }
 
     console.log(`[LLM] Received response in ${elapsed}s (${content.length} chars)`);
+
+    // Store debug info
+    lastLlmDebug = {
+      timestamp: new Date().toISOString(),
+      sourceFile,
+      model,
+      elapsed: parseFloat(elapsed),
+      inputChars: inputText.length,
+      responseChars: content.length,
+      rawResponse: content.substring(0, 5000),
+      inputPreview: inputText.substring(0, 3000),
+      usage: completion.usage || null,
+    };
 
     const parsed = JSON.parse(content);
     // The response might be { plans: [...] } or just [...]
@@ -407,6 +428,8 @@ CRITICAL RULES:
 
     if (!Array.isArray(rawPlans) || rawPlans.length === 0) {
       console.log(`[LLM] No plans in response`);
+      lastLlmDebug.parsedType = typeof parsed === 'object' ? Object.keys(parsed).join(',') : typeof parsed;
+      lastLlmDebug.rawPlanCount = 0;
       return [];
     }
 
@@ -463,6 +486,7 @@ CRITICAL RULES:
   } catch (err) {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     console.error(`[LLM] Error after ${elapsed}s: ${err.message}`);
+    lastLlmDebug = { timestamp: new Date().toISOString(), sourceFile, model, elapsed: parseFloat(elapsed), error: err.message, inputChars: text.length };
     return [];
   }
 }
