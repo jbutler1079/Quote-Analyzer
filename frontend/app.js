@@ -13,6 +13,7 @@ const state = {
       ef: { type: 'percent', value: 0 },
     },
   },
+  currentPremiums: { ee: null, es: null, ec: null, ef: null },
   recommendations: null,
   sortCol: null,
   sortDir: 'asc',
@@ -47,12 +48,41 @@ function resolveApiBase() {
 /* ── API helpers ──────────────────────────────────────────────────────────── */
 function getApiBase() { return API_BASE; }
 
+const REQUEST_TIMEOUT_MS = {
+  health: 15000,
+  upload: 120000,
+  parse: 180000,
+  default: 60000,
+};
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS.default) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const opts = { ...options, signal: controller.signal };
+    return await fetch(url, opts);
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      throw new Error(`Request timed out after ${Math.ceil(timeoutMs / 1000)}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function assertApiReachable() {
+  const resp = await fetchWithTimeout(`${getApiBase()}/health`, { method: 'GET' }, REQUEST_TIMEOUT_MS.health);
+  if (!resp.ok) throw new Error(`API health check failed (HTTP ${resp.status})`);
+}
+
 async function apiPost(path, body) {
-  const resp = await fetch(`${getApiBase()}${path}`, {
+  const timeoutMs = path === '/parse' ? REQUEST_TIMEOUT_MS.parse : REQUEST_TIMEOUT_MS.default;
+  const resp = await fetchWithTimeout(`${getApiBase()}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  });
+  }, timeoutMs);
   if (!resp.ok) {
     if (resp.status === 404 && !getApiBase()) {
       throw new Error('HTTP 404 (API endpoint not found). This page is likely embedded on a different host. Set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
@@ -64,10 +94,11 @@ async function apiPost(path, body) {
 }
 
 async function apiPostForm(path, formData) {
-  const resp = await fetch(`${getApiBase()}${path}`, {
+  const timeoutMs = path === '/upload' ? REQUEST_TIMEOUT_MS.upload : REQUEST_TIMEOUT_MS.default;
+  const resp = await fetchWithTimeout(`${getApiBase()}${path}`, {
     method: 'POST',
     body: formData,
-  });
+  }, timeoutMs);
   if (!resp.ok) {
     if (resp.status === 404 && !getApiBase()) {
       throw new Error('HTTP 404 (API endpoint not found). This page is likely embedded on a different host. Set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
@@ -79,11 +110,11 @@ async function apiPostForm(path, formData) {
 }
 
 async function apiPostBlob(path, body) {
-  const resp = await fetch(`${getApiBase()}${path}`, {
+  const resp = await fetchWithTimeout(`${getApiBase()}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  });
+  }, REQUEST_TIMEOUT_MS.default);
   if (!resp.ok) {
     if (resp.status === 404 && !getApiBase()) {
       throw new Error('HTTP 404 (API endpoint not found). This page is likely embedded on a different host. Set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
@@ -178,9 +209,12 @@ function renderFileList() {
 async function processFiles() {
   if (state.files.length === 0) return;
 
-  showLoading(true, 'Uploading files…');
+  showLoading(true, 'Connecting to API…');
   try {
+    await assertApiReachable();
+
     // 1. Upload
+    showLoading(true, 'Uploading files…');
     const formData = new FormData();
     state.files.forEach(f => formData.append('files[]', f.file, f.name));
     const uploadData = await apiPostForm('/upload', formData);
@@ -212,7 +246,7 @@ async function processFiles() {
     }
   } catch (err) {
     showLoading(false);
-    showToast(`Upload/parse failed: ${err.message}`, 'error');
+    showToast(`Upload/parse failed: ${err.message}. If this is a WordPress embed, verify window.QUOTE_ANALYZER_API_BASE and that the API is awake.`, 'error');
     console.error(err);
   }
 }
@@ -229,11 +263,60 @@ const FREQ_LABEL = {
 };
 
 function renderPlansTable(plans) {
+  const thead = document.getElementById('plansTableHead');
   const tbody = document.getElementById('plansTableBody');
   tbody.innerHTML = '';
 
+  // Determine if current premiums are entered (any non-null value)
+  const cp = state.currentPremiums || {};
+  const hasCurrentPremiums = cp.ee != null || cp.es != null || cp.ec != null || cp.ef != null;
+
+  // Build dynamic header
+  const headerCols = [
+    { col: 'carrier', label: 'Carrier', sortable: true },
+    { col: 'planName', label: 'Plan', sortable: true },
+    { col: 'networkType', label: 'Net', sortable: true },
+    { col: 'metalLevel', label: 'Metal', sortable: true },
+    { col: 'deductibleIndividual', label: 'Ded', sortable: true },
+    { col: 'oopMaxIndividual', label: 'OOP', sortable: true },
+    { col: 'copayPCP', label: 'PCP', sortable: true },
+    { col: 'premiumEE', label: 'EE', sortable: true },
+    { col: 'premiumES', label: 'ES', sortable: true },
+    { col: 'premiumEC', label: 'EC', sortable: true },
+    { col: 'premiumEF', label: 'EF', sortable: true },
+  ];
+  if (hasCurrentPremiums) {
+    headerCols.push({ col: '_deltaVsCurrent', label: 'Δ vs Current', sortable: false, cssClass: 'delta-col' });
+  }
+  headerCols.push(
+    { col: '_erPerPay', label: 'ER/Pay', sortable: false, cssClass: 'cost-col' },
+    { col: '_eePerPay', label: 'EE/Pay', sortable: false, cssClass: 'cost-col' },
+    { col: 'extractionConfidence', label: 'Conf', sortable: true },
+    { col: 'sourceFile', label: 'Src', sortable: false },
+  );
+
+  const headTr = document.createElement('tr');
+  headerCols.forEach(hc => {
+    const th = document.createElement('th');
+    if (hc.cssClass) th.className = hc.cssClass;
+    if (hc.sortable) {
+      th.className = (th.className ? th.className + ' ' : '') + 'sortable';
+      th.tabIndex = 0;
+      th.setAttribute('data-col', hc.col);
+      th.innerHTML = `${escHtml(hc.label)} <span class="sort-icon">↕</span>`;
+    } else {
+      th.setAttribute('data-col', hc.col);
+      th.textContent = hc.label;
+    }
+    headTr.appendChild(th);
+  });
+  thead.innerHTML = '';
+  thead.appendChild(headTr);
+
+  const colCount = headerCols.length;
+
   if (plans.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="15" style="text-align:center;padding:24px;color:var(--muted)">No plans extracted</td></tr>';
+    tbody.innerHTML = `<tr><td colspan="${colCount}" style="text-align:center;padding:24px;color:var(--muted)">No plans extracted</td></tr>`;
     return;
   }
 
@@ -266,6 +349,32 @@ function renderPlansTable(plans) {
       { col: 'premiumES',             val: fmtPrem(plan.premiumES), editable: true },
       { col: 'premiumEC',             val: fmtPrem(plan.premiumEC), editable: true },
       { col: 'premiumEF',             val: fmtPrem(plan.premiumEF), editable: true },
+    ];
+
+    // Delta vs Current column (weighted average change across tiers)
+    if (hasCurrentPremiums) {
+      const deltas = [];
+      COVERAGE_TIERS.forEach(tier => {
+        const currentVal = cp[tier];
+        const quotedVal = Number(plan[PREMIUM_KEY_BY_TIER[tier]]);
+        if (currentVal != null && Number.isFinite(quotedVal) && quotedVal > 0) {
+          deltas.push({ tier, diff: quotedVal - currentVal, pct: ((quotedVal - currentVal) / currentVal) * 100 });
+        }
+      });
+
+      let deltaHtml = '—';
+      if (deltas.length > 0) {
+        const lines = deltas.map(d => {
+          const sign = d.diff > 0 ? '+' : '';
+          const cls = d.diff > 0 ? 'delta-positive' : d.diff < 0 ? 'delta-negative' : 'delta-zero';
+          return `<span class="${cls}">${d.tier.toUpperCase()}: ${sign}$${Math.abs(d.diff).toFixed(2)} (${sign}${d.pct.toFixed(1)}%)</span>`;
+        });
+        deltaHtml = lines.join('<br>');
+      }
+      cells.push({ col: '_deltaVsCurrent', val: deltaHtml, editable: false, cssClass: 'delta-col' });
+    }
+
+    cells.push(
       {
         col: '_erPerPay',
         val: `<span class="er-cost">${erPay > 0 ? fmtPrem(erPay) : '—'}</span>`,
@@ -287,7 +396,7 @@ function renderPlansTable(plans) {
         editable: false,
       },
       { col: 'sourceFile', val: `<span style="font-size:0.75rem;color:var(--muted)" title="${escHtml(plan.sourceFile || '')}">${escHtml(truncate(plan.sourceFile || '—', 20))}</span>`, editable: false },
-    ];
+    );
 
     cells.forEach(({ col, val, editable, cssClass }) => {
       const td = document.createElement('td');
@@ -392,6 +501,24 @@ function sortTable(col) {
 }
 
 /* ── Census ───────────────────────────────────────────────────────────────── */
+function updateCurrentPremiums() {
+  const parse = id => {
+    const v = parseFloat(document.getElementById(id)?.value);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  };
+  state.currentPremiums = {
+    ee: parse('currentPremiumEE'),
+    es: parse('currentPremiumES'),
+    ec: parse('currentPremiumEC'),
+    ef: parse('currentPremiumEF'),
+  };
+
+  // Re-render plans table to show updated deltas
+  if (state.plans.length > 0) {
+    renderPlansTable(state.plans);
+  }
+}
+
 function updateCensus() {
   state.census = {
     ee: parseInt(document.getElementById('eeCount').value, 10) || 0,
@@ -563,6 +690,7 @@ async function getRecommendations() {
       caseId: state.caseId,
       census: state.census,
       contribution: state.contribution,
+      currentPremiums: state.currentPremiums,
     });
     state.recommendations = data;
     renderRecommendations(data);
@@ -716,6 +844,7 @@ async function downloadPPTX() {
       clientName: document.getElementById('clientName').value || 'Client',
       effectiveDate: document.getElementById('effectiveDate').value || '',
       contribution: state.contribution,
+      currentPremiums: state.currentPremiums,
     });
     triggerDownload(blob, filename || 'BenefitsAnalysis.pptx');
     showLoading(false);
@@ -736,6 +865,7 @@ async function downloadXLSX() {
       clientName: document.getElementById('clientName').value || 'Client',
       effectiveDate: document.getElementById('effectiveDate').value || '',
       contribution: state.contribution,
+      currentPremiums: state.currentPremiums,
     });
     triggerDownload(blob, filename || 'BenefitsAnalysis.xlsx');
     showLoading(false);
@@ -809,6 +939,7 @@ function truncate(str, len) {
 (function init() {
   // Initialize census display
   updateCensus();
+  updateCurrentPremiums();
   updateContributionSettings();
   renderContributionSummary();
   // Sections that are hidden until data exists

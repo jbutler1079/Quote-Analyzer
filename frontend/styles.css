@@ -437,6 +437,69 @@ input:focus {
   flex-shrink: 0;
 }
 
+/* ── Current Premiums ────────────────────────────────────────────────────── */
+.current-premiums-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+  align-items: flex-end;
+}
+
+.current-premium-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 160px;
+}
+
+.current-premium-group label {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.input-with-prefix {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  transition: border-color var(--transition);
+}
+
+.input-with-prefix:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(46, 134, 222, 0.15);
+}
+
+.input-prefix {
+  padding: 8px 10px;
+  background: var(--bg);
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.95rem;
+  border-right: 1px solid var(--border);
+  user-select: none;
+}
+
+.premium-input {
+  border: none;
+  outline: none;
+  padding: 8px 10px;
+  font-size: 1rem;
+  font-weight: 600;
+  width: 120px;
+  background: transparent;
+}
+
+.premium-input::placeholder {
+  color: var(--muted);
+  font-weight: 400;
+}
+
 /* ── Census ──────────────────────────────────────────────────────────────── */
 .census-grid {
   display: flex;
@@ -656,6 +719,24 @@ input:focus {
   color: #d97706;
   font-weight: 600;
   font-size: 0.85rem;
+}
+
+/* ── Delta (vs Current) ─────────────────────────────────────────────────── */
+.plans-table th.delta-col,
+.plans-table td.delta-col {
+  text-align: right;
+  white-space: nowrap;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+.delta-positive {
+  color: var(--error);
+}
+.delta-negative {
+  color: var(--success);
+}
+.delta-zero {
+  color: var(--muted);
 }
 
 /* ── Recommendation Cards ────────────────────────────────────────────────── */
@@ -1086,6 +1167,8 @@ input:focus {
 
   .census-grid { flex-direction: column; gap: 12px; }
   .census-input { width: 100%; }
+  .current-premiums-grid { flex-direction: column; gap: 12px; }
+  .premium-input { width: 100%; }
 
   .contribution-grid {
     grid-template-columns: 1fr;

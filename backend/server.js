@@ -158,7 +158,7 @@ const upload = multer({
 // ── Auth middleware (disabled – internal tool) ───────────────────────────────
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'bcbs-strategy9-v2', strategies: 9 }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'uhc-strategy12-v1', strategies: 12 }));
 
 // ── Debug: last extraction info ───────────────────────────────────────────────
 app.get('/debug/lastextract', (_req, res) => {
@@ -478,6 +478,17 @@ function extractPlanFromText(text, sourceFile) {
     }
   } catch (e) { console.log(`[EXTRACT] Strategy 11 error: ${e.message}`); }
 
+  // ── Strategy 12: UHC / UnitedHealthcare Quote Grid ────────────────────────
+  try {
+    const uhcPlans = extractFromUHCQuote(text, sourceFile);
+    if (uhcPlans.length > 0) {
+      // Small tiebreaker bonus for carrier-specific strategies (same as Aetna/BCBS/BSW)
+      const score = scoreStrategyResult(uhcPlans) + 0.1;
+      console.log(`[EXTRACT] Strategy 12 (UHC quote): ${uhcPlans.length} plans, score=${score}`);
+      candidates.push({ name: 'UHC quote grid', plans: uhcPlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 12 error: ${e.message}`); }
+
   // ── Pick the best strategy by quality score ─────────────────────────────
   let plans = [];
   if (candidates.length > 0) {
@@ -520,6 +531,20 @@ function extractPlanFromText(text, sourceFile) {
   const globalCarrier = detectCarrier(fullText, sourceFile);
   for (const plan of plans) {
     if (!plan.carrier && globalCarrier) plan.carrier = globalCarrier;
+  }
+
+  // ── Post-extraction: apply effective date from full text if not per-plan ─
+  const hasDateGap = plans.some(p => !p.effectiveDate);
+  if (hasDateGap) {
+    const effDateGlobal = firstMatch(fullText, [
+      /effective\s*(?:date)?\s*[:\-]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i,
+      /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})\s*(?:effective|start)/i,
+    ]);
+    if (effDateGlobal) {
+      for (const plan of plans) {
+        if (!plan.effectiveDate) plan.effectiveDate = effDateGlobal;
+      }
+    }
   }
 
   // De-duplicate plans that have the same planName + carrier
@@ -1301,6 +1326,492 @@ function extractFromBSWRateSheet(text, sourceFile) {
   if (plans.length === 0) return [];
   console.log(`[EXTRACT] BSW rate sheet: found ${plans.length} plans`);
   return plans;
+}
+
+// ── Strategy 12: UHC / UnitedHealthcare Quote Grid ────────────────────────────
+// Handles UHC "Group Specialty" (GS) and standard multi-plan quote PDFs.
+// UHC quotes typically have a columnar benefit comparison grid where plan names
+// appear as column headers and benefit labels as rows.  pdf-parse often renders
+// these as one of:
+// UHC "Medical Proposed Rates" format:
+//   - Multi-page document, each page has 2-3 "Options"
+//   - Pages separated by "UnitedHealthcare\nMedical Proposed Rates for <CLIENT>"
+//   - Each page: Option headers, Plan Name codes, Product (INS-Choice etc),
+//     benefits (concatenated values), rates (concatenated $amounts)
+//   - Rate pages identified by "Option \d+" pattern
+function extractFromUHCQuote(text, sourceFile) {
+  // Gate: must look like a UHC/UnitedHealthcare document
+  if (!/United\s*Health(?:care)?|UHC|\bINS-Choice|\bINS-Surest/i.test(text) &&
+      !/UHC/i.test(sourceFile || '')) return [];
+
+  const carrier = 'UnitedHealthcare';
+
+  // ── Effective date ──
+  let effectiveDate = null;
+  const effM = text.match(/Effective\s*(?:Date)?\s*[:\-]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i);
+  if (effM) effectiveDate = effM[1];
+
+  // ── Split into page blocks ──
+  // Split on "UnitedHealthcare\nMedical Proposed Rates" which starts each page
+  const pageBlocks = text.split(/(?=UnitedHealthcare\nMedical Proposed Rates)/);
+  const ratePages = pageBlocks.filter(b => /Option\s+\d+/i.test(b.substring(0, 600)));
+
+  if (ratePages.length === 0) return [];
+  console.log(`[UHC] Found ${ratePages.length} rate page(s)`);
+
+  const allPlans = [];
+
+  for (const page of ratePages) {
+    const lines = page.split('\n').map(l => l.trim());
+
+    // ── Find Option numbers on this page ──
+    // e.g. "Option 1Option 2Option 3" or "Option 16Option 17"
+    let optionNumbers = [];
+    let optionLineIdx = -1;
+    for (let i = 0; i < Math.min(15, lines.length); i++) {
+      const optMatches = [...lines[i].matchAll(/Option\s+(\d+)/gi)];
+      if (optMatches.length >= 2) {
+        optionNumbers = optMatches.map(m => parseInt(m[1], 10));
+        optionLineIdx = i;
+        break;
+      }
+    }
+    if (optionNumbers.length === 0) continue;
+    const numPlans = optionNumbers.length;
+
+    // ── Extract plan name codes ──
+    // After "Plan Name" line, expect N plan code blocks (may wrap across lines)
+    // e.g. "EITP (EPO HSA Emb) Rx plan: \nMM"
+    let planNameStartIdx = -1;
+    for (let i = optionLineIdx + 1; i < Math.min(optionLineIdx + 5, lines.length); i++) {
+      if (/^Plan\s+Name$/i.test(lines[i])) { planNameStartIdx = i; break; }
+    }
+
+    const planNames = [];
+    if (planNameStartIdx >= 0) {
+      // Collect lines between "Plan Name" and "Product" — these contain the plan codes
+      let productIdx = -1;
+      for (let i = planNameStartIdx + 1; i < Math.min(planNameStartIdx + 20, lines.length); i++) {
+        if (/^Product$/i.test(lines[i])) { productIdx = i; break; }
+      }
+      if (productIdx > planNameStartIdx) {
+        // Join all non-empty lines between Plan Name and Product
+        const nameLines = lines.slice(planNameStartIdx + 1, productIdx).filter(l => l.length > 0);
+        // Plan codes look like "EITP (EPO HSA Emb) Rx plan:" or "EIZ4 (EPO PROformance) Rx\nplan: Z9"
+        // They start with a 4-char alphanumeric code
+        const rawText = nameLines.join('\n');
+        // Split on plan code pattern: alphanumeric/underscore code followed by " ("
+        const codeRe = /(?:^|\n)\s*([A-Z][A-Z0-9_]{1,20})\s*\(/gi;
+        const codeParts = [];
+        let match;
+        while ((match = codeRe.exec(rawText)) !== null) {
+          codeParts.push({ code: match[1], pos: match.index });
+        }
+        if (codeParts.length >= numPlans) {
+          for (let p = 0; p < numPlans; p++) {
+            const start = codeParts[p].pos;
+            const end = p + 1 < codeParts.length ? codeParts[p + 1].pos : rawText.length;
+            let nameChunk = rawText.substring(start, end).replace(/\n/g, ' ').trim();
+            // Clean trailing whitespace and partial Rx info
+            nameChunk = nameChunk.replace(/\s+/g, ' ').replace(/\s*$/, '');
+            planNames.push(nameChunk);
+          }
+        } else {
+          // Fallback: just join lines and split evenly
+          const joinedNames = nameLines.join(' ').replace(/\s+/g, ' ');
+          planNames.push(joinedNames);
+        }
+      }
+    }
+
+    // ── Extract Product line (INS-Choice, HMO-NexusACO R, etc) ──
+    const products = [];
+    for (let i = optionLineIdx; i < Math.min(optionLineIdx + 25, lines.length); i++) {
+      if (/^Product$/i.test(lines[i])) {
+        // Next non-empty line has concatenated products
+        for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+          const pl = lines[j];
+          if (!pl) continue;
+          // Split concatenated products: "INS-ChoiceINS-ChoiceINS-Choice"
+          // or "INS-Choice +INS-Choice +INS-Choice +"
+          const productRe = /((?:INS-[A-Za-z+ ]+|HMO-[A-Za-z+ ]+|PPO-[A-Za-z+ ]+|EPO-[A-Za-z+ ]+|Surest[A-Za-z+ ]*|[A-Z]{3,}-[A-Za-z+ ]+?)(?=(?:INS-|HMO-|PPO-|EPO-|Surest|[A-Z]{3,}-)|$))/gi;
+          const pMatches = [...pl.matchAll(productRe)];
+          if (pMatches.length >= numPlans) {
+            for (const pm of pMatches) products.push(pm[1].trim());
+          } else if (pl.length > 3) {
+            // Try to split by known product prefixes
+            const splits = pl.split(/(INS-|HMO-|PPO-|EPO-)/i).filter(Boolean);
+            let current = '';
+            for (const s of splits) {
+              if (/^(INS-|HMO-|PPO-|EPO-)$/i.test(s)) {
+                if (current) products.push(current.trim());
+                current = s;
+              } else {
+                current += s;
+              }
+            }
+            if (current) products.push(current.trim());
+          }
+          if (products.length > 0) break;
+        }
+        break;
+      }
+    }
+
+    // ── Derive network type from plan name/product ──
+    function deriveNetwork(planName, product) {
+      const combined = (planName + ' ' + product).toLowerCase();
+      if (/\bepo\b/.test(combined)) return 'EPO';
+      if (/\bhmo\b/.test(combined)) return 'HMO';
+      if (/\bppo\b/.test(combined)) return 'PPO';
+      if (/\bpos\b/.test(combined)) return 'POS';
+      if (/\bhsa\b/.test(combined)) return 'HSA';
+      if (/surest/i.test(combined)) return 'Surest';
+      return null;
+    }
+
+    // ── Extract HRA/HSA line ──
+    const hsaFlags = [];
+    for (let i = optionLineIdx; i < Math.min(optionLineIdx + 30, lines.length); i++) {
+      if (/^HRA\/HSA$/i.test(lines[i])) {
+        for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+          const hl = lines[j];
+          if (!hl) continue;
+          // Concatenated: "HSAHSANo" or "NoHSANo" — no word boundaries
+          const hsaRe = /(HSA|HRA|No)/gi;
+          const hMatches = [...hl.matchAll(hsaRe)];
+          if (hMatches.length >= numPlans) {
+            for (const hm of hMatches) hsaFlags.push(hm[1].toUpperCase());
+          }
+          if (hsaFlags.length > 0) break;
+        }
+        break;
+      }
+    }
+
+    // ── Extract Deductible line ──
+    // Line: "$6,750 / $13,500 / Emb$5,000 / $10,000 / Emb$5,000 / $10,000 / Emb"
+    // Each option has "ind / fam / Emb" pattern separated by concatenation
+    function extractDeductibleOOP(label) {
+      const results = [];
+      for (let i = optionLineIdx; i < lines.length; i++) {
+        if (lines[i] === label) {
+          // Scan next few lines for dollar amounts
+          for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+            const dl = lines[j];
+            if (!dl || dl === ' ') continue;
+            // Split by "Emb" or "N/A" boundaries to separate option blocks
+            // Pattern: "$X / $Y / Emb" repeating, or "$0 / $0 / N/A" 
+            const blockRe = /(\$[\d,]+(?:\.\d+)?\s*\/\s*\$[\d,]+(?:\.\d+)?\s*\/\s*(?:Emb|N\/A|Agg))/gi;
+            const blocks = [...dl.matchAll(blockRe)];
+            if (blocks.length >= numPlans) {
+              for (const b of blocks) {
+                const amts = [...b[1].matchAll(/\$([\d,]+(?:\.\d+)?)/g)];
+                const ind = amts[0] ? parseMoney(amts[0][1]) : null;
+                const fam = amts[1] ? parseMoney(amts[1][1]) : null;
+                results.push({ individual: ind, family: fam });
+              }
+              return results;
+            }
+            // Fallback: just extract all dollar amounts and pair them
+            const allAmts = [...dl.matchAll(/\$([\d,]+(?:\.\d+)?)/g)];
+            if (allAmts.length >= numPlans * 2) {
+              for (let p = 0; p < numPlans; p++) {
+                const ind = parseMoney(allAmts[p * 2][1]);
+                const fam = parseMoney(allAmts[p * 2 + 1][1]);
+                results.push({ individual: ind, family: fam });
+              }
+              return results;
+            }
+            // Single value per plan
+            if (allAmts.length >= numPlans) {
+              for (let p = 0; p < numPlans; p++) {
+                results.push({ individual: parseMoney(allAmts[p][1]), family: null });
+              }
+              return results;
+            }
+          }
+          break;
+        }
+      }
+      return results;
+    }
+
+    // Search for "Deductible" or "Out-of-Pocket" under In-Network section only
+    // The structure: "In Network" → benefit rows → "Out of Network"
+    // Values are concatenated per-option blocks ending in Emb|N/A|Agg:
+    //   "$3,000 / $6,000 / Emb$3,500 / $7,000 / EmbN/A / Emb"
+    function findInNetworkDeductibleOOP(label) {
+      let inNetStart = -1;
+      let outNetStart = lines.length;
+      for (let i = optionLineIdx; i < lines.length; i++) {
+        if (/^In Network/i.test(lines[i]) && inNetStart === -1) inNetStart = i;
+        if (/^Out of Network/i.test(lines[i]) && inNetStart >= 0) { outNetStart = i; break; }
+      }
+      if (inNetStart < 0) inNetStart = optionLineIdx;
+
+      const results = [];
+      for (let i = inNetStart; i < outNetStart; i++) {
+        if (lines[i] === label) {
+          for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+            const dl = lines[j];
+            if (!dl || dl === ' ') continue;
+            // Split into per-option blocks by splitting on Emb|N/A|Agg terminators
+            // Each block: "$X / $Y / Emb" or "N/A / Emb" or "$X / $Y / N/A"
+            const blockParts = dl.split(/(?<=Emb|N\/A|Agg)(?=[^\s\/]|$)/i).filter(b => b.trim());
+            if (blockParts.length >= numPlans) {
+              for (let p = 0; p < numPlans; p++) {
+                const block = blockParts[p];
+                const amts = [...block.matchAll(/\$([\d,]+(?:\.\d+)?)/g)];
+                if (amts.length >= 2) {
+                  results.push({ individual: parseMoney(amts[0][1]), family: parseMoney(amts[1][1]) });
+                } else if (amts.length === 1) {
+                  results.push({ individual: parseMoney(amts[0][1]), family: null });
+                } else {
+                  results.push({ individual: null, family: null }); // N/A block
+                }
+              }
+              return results;
+            }
+            // Fallback: all dollar amounts paired (2 per plan)
+            const allAmts = [...dl.matchAll(/\$([\d,]+(?:\.\d+)?)/g)];
+            if (allAmts.length >= numPlans * 2) {
+              for (let p = 0; p < numPlans; p++) {
+                results.push({ individual: parseMoney(allAmts[p * 2][1]), family: parseMoney(allAmts[p * 2 + 1][1]) });
+              }
+              return results;
+            }
+            if (allAmts.length >= numPlans) {
+              for (let p = 0; p < numPlans; p++) {
+                results.push({ individual: parseMoney(allAmts[p][1]), family: null });
+              }
+              return results;
+            }
+          }
+          break;
+        }
+      }
+      return results;
+    }
+
+    const deductibles = findInNetworkDeductibleOOP('Deductible');
+    const oopValues = findInNetworkDeductibleOOP('Out-of-Pocket');
+
+    // ── Extract copay from "Office Copay (PCP/SPC)" line ──
+    // Format: entire copay section spans from "Office Copay (PCP/SPC)" to "Hospital Copays"
+    // The label may be merged with the first plan's copay on the same line:
+    //   "Office Copay (PCP/SPC)PCP $15, SCP $50/$100"
+    //   "PCP Ded+100%, SCP Ded+100%"
+    //   "PCP $10, SCP $30"
+    const copays = { pcp: [], specialist: [] };
+    for (let i = optionLineIdx; i < lines.length; i++) {
+      if (/Office\s*Copay.*PCP/i.test(lines[i])) {
+        // Include the copay label line itself (text after the label) and subsequent lines
+        const afterLabel = lines[i].replace(/^.*Office\s*Copay\s*\([^)]*\)/i, '').trim();
+        const copayLines = afterLabel ? [afterLabel] : [];
+        for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+          if (/^(?:Hospital|UC\/ER|Major|X-ray|Deductible|Coinsurance|Out-of-Pocket|Pharmacy|Enrollment|Rates)/i.test(lines[j])) break;
+          if (lines[j] && lines[j] !== ' ') copayLines.push(lines[j]);
+        }
+        // Join and parse all PCP/SPC copay amounts
+        const copayText = copayLines.join(' ');
+        // Match "PCP $XX" and "PCP Ded+" patterns per plan
+        const pcpDollarMatches = [...copayText.matchAll(/PCP\s+\$(\d+)/gi)];
+        const pcpDedMatches = [...copayText.matchAll(/PCP\s+Ded\+/gi)];
+        const spcDollarMatches = [...copayText.matchAll(/S(?:CP|PC)\s+\$(\d+)/gi)];
+        const spcDedMatches = [...copayText.matchAll(/S(?:CP|PC)\s+Ded\+/gi)];
+        // Build per-plan copays in order of appearance
+        const pcpAll = [];
+        const spcAll = [];
+        // Merge dollar and ded matches by position
+        const pcpEntries = [
+          ...pcpDollarMatches.map(m => ({ pos: m.index, val: parseInt(m[1], 10) })),
+          ...pcpDedMatches.map(m => ({ pos: m.index, val: null }))
+        ].sort((a, b) => a.pos - b.pos);
+        const spcEntries = [
+          ...spcDollarMatches.map(m => ({ pos: m.index, val: parseInt(m[1], 10) })),
+          ...spcDedMatches.map(m => ({ pos: m.index, val: null }))
+        ].sort((a, b) => a.pos - b.pos);
+        for (const e of pcpEntries) copays.pcp.push(e.val);
+        for (const e of spcEntries) copays.specialist.push(e.val);
+        break;
+      }
+    }
+
+    // ── Extract ER copay from UC/ER line ──
+    const erCopays = [];
+    for (let i = optionLineIdx; i < lines.length; i++) {
+      if (/^UC\/ER$/i.test(lines[i])) {
+        const ucerLines = [];
+        for (let j = i + 1; j < Math.min(i + 6, lines.length); j++) {
+          if (/^(?:Major|X-ray|Deductible|Coinsurance|Out-of-Pocket|Pharmacy|Enrollment|Rates|Office)/i.test(lines[j])) break;
+          if (lines[j] && lines[j] !== ' ') ucerLines.push(lines[j]);
+        }
+        const ucerText = ucerLines.join(' ');
+        const erMatches = [...ucerText.matchAll(/ER\s+\$(\d+)/gi)];
+        for (const em of erMatches) erCopays.push(parseInt(em[1], 10));
+        break;
+      }
+    }
+
+    // ── Extract Coinsurance ──
+    // Format: "100%100%80%" or "75%100%100%" or "100%N/A"
+    // Must parse in order, interleaving percentages and N/A
+    const coinsurances = [];
+    for (let i = optionLineIdx; i < lines.length; i++) {
+      if (/^Coinsurance$/i.test(lines[i])) {
+        for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+          const cl = lines[j];
+          if (!cl || cl === ' ') continue;
+          // Split into tokens by matching percentages and N/A in order
+          const tokenRe = /(\d+)%|N\/A/gi;
+          let tm;
+          while ((tm = tokenRe.exec(cl)) !== null) {
+            if (tm[1]) coinsurances.push(parseInt(tm[1], 10));
+            else coinsurances.push(null); // N/A
+          }
+          if (coinsurances.length >= numPlans) break;
+        }
+        break; // Only use first "Coinsurance" (In Network section)
+      }
+    }
+
+    // ── Extract Rates ──
+    // Find "EE Only" line, followed by concatenated rates "$417.17$453.18$480.37"
+    const rates = { ee: [], es: [], ec: [], ef: [] };
+    const rateLabels = [
+      { key: 'ee', re: /^EE\s*Only$/i },
+      { key: 'es', re: /^EE\+Spouse\b/i },
+      { key: 'ec', re: /^EE\+Ch\(?ren\)?\b/i },
+      { key: 'ef', re: /^Family\b/i },
+    ];
+
+    // Find the "Rates" section marker
+    let ratesStartIdx = -1;
+    for (let i = optionLineIdx; i < lines.length; i++) {
+      if (/^Rates$/i.test(lines[i])) { ratesStartIdx = i; break; }
+    }
+    if (ratesStartIdx < 0) ratesStartIdx = Math.floor(lines.length * 0.6); // fallback
+
+    for (const rl of rateLabels) {
+      for (let i = ratesStartIdx; i < lines.length; i++) {
+        if (rl.re.test(lines[i])) {
+          // Look at this line and next few for dollar amounts
+          for (let j = i; j < Math.min(i + 3, lines.length); j++) {
+            const rateLine = lines[j];
+            const amts = [...rateLine.matchAll(/\$([\d,]+(?:\.\d{1,2})?)/g)];
+            if (amts.length >= numPlans) {
+              for (const a of amts) rates[rl.key].push(parseMoney(a[1]));
+              break;
+            }
+          }
+          break;
+        }
+        // Also handle inline: "EE+Spouse $917.77$996.99$1,056.81"
+        if (rl.key !== 'ee' && rl.re.test(lines[i].split(/\$/)[0])) {
+          const amts = [...lines[i].matchAll(/\$([\d,]+(?:\.\d{1,2})?)/g)];
+          if (amts.length >= numPlans) {
+            for (const a of amts) rates[rl.key].push(parseMoney(a[1]));
+            break;
+          }
+        }
+      }
+    }
+
+    // ── Build plan objects ──
+    for (let p = 0; p < numPlans; p++) {
+      const optionNum = optionNumbers[p];
+      const planName = planNames[p] || `Option ${optionNum}`;
+      const product = products[p] || '';
+      const networkType = deriveNetwork(planName, product);
+      const isHSA = (hsaFlags[p] === 'HSA' || hsaFlags[p] === 'HRA');
+
+      const plan = {
+        id: uuidv4(),
+        carrier,
+        planName: `Option ${optionNum}: ${planName}`,
+        planCode: planName.match(/^([A-Z][A-Z0-9_]+)/)?.[1] || null,
+        networkType: isHSA ? (networkType || 'HSA') : networkType,
+        metalLevel: null,
+        deductibleIndividual: deductibles[p]?.individual ?? null,
+        deductibleFamily: deductibles[p]?.family ?? null,
+        oopMaxIndividual: oopValues[p]?.individual ?? null,
+        oopMaxFamily: oopValues[p]?.family ?? null,
+        coinsurance: coinsurances[p] != null ? `${coinsurances[p]}%` : null,
+        copayPCP: copays.pcp[p] ?? null,
+        copaySpecialist: copays.specialist[p] ?? null,
+        copayUrgentCare: null,
+        copayER: erCopays[p] ?? null,
+        rxDeductible: null, rxTier1: null, rxTier2: null, rxTier3: null,
+        premiumEE: rates.ee[p] ?? null,
+        premiumES: rates.es[p] ?? null,
+        premiumEC: rates.ec[p] ?? null,
+        premiumEF: rates.ef[p] ?? null,
+        effectiveDate,
+        product: product || null,
+        hsaEligible: isHSA,
+        ratingArea: null,
+        underwritingNotes: null,
+        extractionConfidence: 0,
+        sourceFile,
+      };
+
+      // Calculate confidence
+      const fields = [plan.deductibleIndividual, plan.deductibleFamily,
+                      plan.oopMaxIndividual, plan.oopMaxFamily,
+                      plan.copayPCP, plan.copaySpecialist, plan.copayER,
+                      plan.premiumEE, plan.premiumES, plan.premiumEC, plan.premiumEF];
+      const found = fields.filter(v => v != null).length;
+      plan.extractionConfidence = Math.min(1, 0.3 + (found * 0.07));
+
+      if (found >= 2) {
+        allPlans.push(plan);
+      }
+    }
+  }
+
+  if (allPlans.length > 0) {
+    console.log(`[UHC] Extracted ${allPlans.length} plans from ${ratePages.length} rate pages`);
+  }
+  return allPlans;
+}
+
+// ── UHC helper: extract dollar amounts from a line ────────────────────────────
+// Handles both spaced ("$3,000  $1,500  $2,000") and concatenated ("$3,000$1,500$2,000")
+function extractDollarAmounts(line) {
+  const cleaned = line
+    .replace(/\b(?:after|AD)\s*(?:deductible|ded)?\b/gi, '')
+    .replace(/\bcopay(?:ment)?\b/gi, '')
+    .replace(/\bcoinsurance\b/gi, '')
+    .replace(/\bper\s*(?:visit|occurrence)\b/gi, '');
+
+  const amounts = [];
+  const re = /\$\s*([\d,]+(?:\.\d{1,2})?)/g;
+  let m;
+  while ((m = re.exec(cleaned)) !== null) {
+    const val = parseMoney(m[1]);
+    if (val != null) amounts.push(val);
+  }
+  return amounts;
+}
+
+// ── UHC helper: assign benefit amounts to plan array ──────────────────────────
+function assignBenefitToPlans(planData, numPlans, benefitDef, amounts) {
+  if (benefitDef.special === 'coinsurance') {
+    for (let p = 0; p < numPlans && p < amounts.length; p++) {
+      if (planData[p].coinsurance == null && amounts[p] != null && amounts[p] <= 100) {
+        planData[p].coinsurance = `${amounts[p]}%`;
+      }
+    }
+    return;
+  }
+  const field = benefitDef.field;
+  if (!field) return;
+  for (let p = 0; p < numPlans && p < amounts.length; p++) {
+    if (planData[p][field] == null && amounts[p] != null) {
+      planData[p][field] = amounts[p];
+    }
+  }
 }
 
 // ── Strategy 8: Aetna Medical Cost Grid ───────────────────────────────────────
@@ -2264,7 +2775,7 @@ function normalizeCarrier(raw) {
   if (!raw) return null;
   const up = raw.replace(/\s+/g, ' ').trim();
   if (/bcbs|blue\s*cross/i.test(up)) return 'BCBS';
-  if (/united\s*health/i.test(up)) return 'UnitedHealthcare';
+  if (/united\s*health|uhc/i.test(up)) return 'UnitedHealthcare';
   if (/baylor|bsw/i.test(up)) return 'Baylor Scott & White';
   return up.charAt(0).toUpperCase() + up.slice(1);
 }
@@ -2420,7 +2931,7 @@ function extractFromRateTable(lines, sourceFile) {
 
 function findPlanNamesInLine(line) {
   const plans = [];
-  const PLAN_KW = /\b(HMO|PPO|EPO|HDHP|HSA|Gold|Silver|Bronze|Platinum|Plus|Select|Choice|Value|Basic|Premier|Standard|Preferred|Essential|Core)\b/i;
+  const PLAN_KW = /\b(HMO|PPO|EPO|HDHP|HSA|Gold|Silver|Bronze|Platinum|Plus|Select|Choice|Value|Basic|Premier|Standard|Preferred|Essential|Core|Navigate|Charter|Compass)\b/i;
 
   // ── Approach 1: Split by tabs or 2+ spaces (common in pdf-parse table output)
   const segments = line.split(/\t|\s{2,}/).map(s => s.trim()).filter(s => s.length > 3 && s.length < 80);

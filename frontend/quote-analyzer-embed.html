@@ -415,6 +415,62 @@
 #qa-app .btn-sub { font-weight: 400; font-size: 0.8rem; opacity: 0.8; }
 #qa-app .btn-icon { width: 18px; height: 18px; flex-shrink: 0; }
 
+/* ── Current Premiums ──────────────────────────────────────────────────── */
+#qa-app .current-premiums-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+  align-items: flex-end;
+}
+#qa-app .current-premium-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 160px;
+}
+#qa-app .current-premium-group label {
+  font-size: 0.88rem;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#qa-app .input-with-prefix {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  transition: border-color var(--transition);
+}
+#qa-app .input-with-prefix:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(46,134,222,0.15);
+}
+#qa-app .input-prefix {
+  padding: 8px 10px;
+  background: var(--bg);
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.95rem;
+  border-right: 1px solid var(--border);
+  user-select: none;
+}
+#qa-app .premium-input {
+  border: none;
+  outline: none;
+  padding: 8px 10px;
+  font-size: 1rem;
+  font-weight: 600;
+  width: 120px;
+  background: transparent;
+}
+#qa-app .premium-input::placeholder {
+  color: var(--muted);
+  font-weight: 400;
+}
+
 /* ── Census ───────────────────────────────────────────────────────────────── */
 #qa-app .census-grid {
   display: flex;
@@ -542,6 +598,12 @@
 #qa-app .plans-table td[data-col="carrier"] { max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #qa-app .er-cost { color: #2563eb; font-weight: 600; font-size: 0.85rem; }
 #qa-app .ee-cost { color: #d97706; font-weight: 600; font-size: 0.85rem; }
+
+/* ── Delta (vs Current) ───────────────────────────────────────────────────── */
+#qa-app .plans-table th.delta-col, #qa-app .plans-table td.delta-col { text-align: right; white-space: nowrap; font-size: 0.78rem; font-weight: 600; }
+#qa-app .delta-positive { color: #e74c3c; }
+#qa-app .delta-negative { color: #27ae60; }
+#qa-app .delta-zero { color: #7f8c8d; }
 
 /* ── Recommendation Cards ─────────────────────────────────────────────────── */
 #qa-app .rec-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
@@ -725,6 +787,8 @@
   #qa-app .btn-export { min-width: 0; width: 100%; justify-content: center; }
   #qa-app .census-grid { flex-direction: column; gap: 12px; }
   #qa-app .census-input { width: 100%; }
+  #qa-app .current-premiums-grid { flex-direction: column; gap: 12px; }
+  #qa-app .premium-input { width: 100%; }
   #qa-app .contribution-grid { grid-template-columns: 1fr; }
   #qa-app .contribution-header { display: none; }
   #qa-app .rec-cards { grid-template-columns: 1fr; }
@@ -809,9 +873,33 @@
       </div>
     </section>
 
-    <!-- 3. Census -->
+    <!-- 3. Current Premium Amounts -->
+    <section class="card" id="currentPremiumsSection">
+      <h2 class="card-title"><span class="step-badge">3</span> Current Premium Amounts</h2>
+      <p class="section-hint">Enter the client's current monthly premium rates per tier. These will be compared against quoted rates to show savings or increases.</p>
+      <div class="current-premiums-grid">
+        <div class="current-premium-group">
+          <label for="currentPremiumEE">EE Only <span class="census-label-sub">Employee Only</span></label>
+          <div class="input-with-prefix"><span class="input-prefix">$</span><input type="number" id="currentPremiumEE" min="0" step="0.01" placeholder="0.00" class="premium-input" oninput="updateCurrentPremiums()" /></div>
+        </div>
+        <div class="current-premium-group">
+          <label for="currentPremiumES">EE + Spouse <span class="census-label-sub">Emp + Spouse</span></label>
+          <div class="input-with-prefix"><span class="input-prefix">$</span><input type="number" id="currentPremiumES" min="0" step="0.01" placeholder="0.00" class="premium-input" oninput="updateCurrentPremiums()" /></div>
+        </div>
+        <div class="current-premium-group">
+          <label for="currentPremiumEC">EE + Child(ren) <span class="census-label-sub">Emp + Child(ren)</span></label>
+          <div class="input-with-prefix"><span class="input-prefix">$</span><input type="number" id="currentPremiumEC" min="0" step="0.01" placeholder="0.00" class="premium-input" oninput="updateCurrentPremiums()" /></div>
+        </div>
+        <div class="current-premium-group">
+          <label for="currentPremiumEF">Family <span class="census-label-sub">Family</span></label>
+          <div class="input-with-prefix"><span class="input-prefix">$</span><input type="number" id="currentPremiumEF" min="0" step="0.01" placeholder="0.00" class="premium-input" oninput="updateCurrentPremiums()" /></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 4. Census -->
     <section class="card" id="censusSection">
-      <h2 class="card-title"><span class="step-badge">3</span> Census</h2>
+      <h2 class="card-title"><span class="step-badge">4</span> Census</h2>
       <div class="census-grid">
         <div class="census-group">
           <label for="eeCount">EE <span class="census-label-sub">Employee Only</span></label>
@@ -841,7 +929,7 @@
 
     <!-- 4. Employer Contribution Setup -->
     <section class="card" id="contributionSection">
-      <h2 class="card-title"><span class="step-badge">4</span> Employer Contribution Setup</h2>
+      <h2 class="card-title"><span class="step-badge">5</span> Employer Contribution Setup</h2>
       <p class="section-hint">Set employer contribution rules and payroll frequency to calculate employer vs employee per-pay-period amounts.</p>
       <div class="form-grid contribution-top-grid">
         <div class="form-group">
@@ -879,30 +967,11 @@
 
     <!-- 5. Extracted Plans -->
     <section class="card qa-hidden" id="plansSection">
-      <h2 class="card-title"><span class="step-badge">5</span> Extracted Plans <span class="badge-count" id="plansCount">0</span></h2>
+      <h2 class="card-title"><span class="step-badge">6</span> Extracted Plans <span class="badge-count" id="plansCount">0</span></h2>
       <p class="section-hint">Click any cell to edit extracted values before generating recommendations.</p>
       <div class="table-wrapper" role="region" aria-label="Extracted plans table" tabindex="0">
         <table class="plans-table" id="plansTable">
-          <thead>
-            <tr>
-              <th class="select-col"><input type="checkbox" class="plan-select-cb" id="selectAllPlans" title="Select / deselect all (max 5)" /></th>
-              <th data-col="carrier" class="sortable" tabindex="0">Carrier <span class="sort-icon">↕</span></th>
-              <th data-col="planName" class="sortable" tabindex="0">Plan Name <span class="sort-icon">↕</span></th>
-              <th data-col="networkType" class="sortable" tabindex="0">Net <span class="sort-icon">↕</span></th>
-              <th data-col="metalLevel" class="sortable" tabindex="0">Metal <span class="sort-icon">↕</span></th>
-              <th data-col="deductibleIndividual" class="sortable" tabindex="0">Ded <span class="sort-icon">↕</span></th>
-              <th data-col="oopMaxIndividual" class="sortable" tabindex="0">OOP <span class="sort-icon">↕</span></th>
-              <th data-col="copayPCP" class="sortable" tabindex="0">PCP <span class="sort-icon">↕</span></th>
-              <th data-col="premiumEE" class="sortable" tabindex="0">EE <span class="sort-icon">↕</span></th>
-              <th data-col="premiumES" class="sortable" tabindex="0">ES <span class="sort-icon">↕</span></th>
-              <th data-col="premiumEC" class="sortable" tabindex="0">EC <span class="sort-icon">↕</span></th>
-              <th data-col="premiumEF" class="sortable" tabindex="0">EF <span class="sort-icon">↕</span></th>
-              <th class="cost-col">ER/Pay</th>
-              <th class="cost-col">EE/Pay</th>
-              <th data-col="extractionConfidence" class="sortable" tabindex="0">Conf <span class="sort-icon">↕</span></th>
-              <th>Src</th>
-            </tr>
-          </thead>
+          <thead id="plansTableHead"></thead>
           <tbody id="plansTableBody"></tbody>
         </table>
       </div>
@@ -910,13 +979,13 @@
 
     <!-- 6. Recommendations -->
     <section class="card qa-hidden" id="recommendationsSection">
-      <h2 class="card-title"><span class="step-badge">6</span> Top Recommendations</h2>
+      <h2 class="card-title"><span class="step-badge">7</span> Top Recommendations</h2>
       <div class="rec-cards" id="recCards"></div>
     </section>
 
     <!-- 7. Generate Outputs -->
     <section class="card qa-hidden" id="outputsSection">
-      <h2 class="card-title"><span class="step-badge">7</span> Generate Outputs</h2>
+      <h2 class="card-title"><span class="step-badge">8</span> Generate Outputs</h2>
       <p class="section-hint">Select up to 5 plans from the table above for your PowerPoint, or use the auto-recommended plans.</p>
       <div class="selection-panel" id="selectionPanel">
         <div class="selection-panel-header">
@@ -971,6 +1040,7 @@
         ef: { type: 'percent', value: 0 },
       },
     },
+    currentPremiums: { ee: null, es: null, ec: null, ef: null },
     recommendations: null,
     sortCol: null,
     sortDir: 'asc',
@@ -997,8 +1067,38 @@
   /* ── API helpers ──────────────────────────────────────────────────────── */
   function getApiBase() { return API_BASE; }
 
+  var REQUEST_TIMEOUT_MS = {
+    health: 15000,
+    upload: 120000,
+    parse: 180000,
+    default: 60000,
+  };
+
+  async function fetchWithTimeout(url, options, timeoutMs) {
+    var controller = new AbortController();
+    var timer = setTimeout(function() { controller.abort(); }, timeoutMs || REQUEST_TIMEOUT_MS.default);
+    try {
+      var opts = options || {};
+      opts.signal = controller.signal;
+      return await fetch(url, opts);
+    } catch (err) {
+      if (err && err.name === 'AbortError') {
+        throw new Error('Request timed out after ' + Math.ceil((timeoutMs || REQUEST_TIMEOUT_MS.default) / 1000) + 's');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async function assertApiReachable() {
+    var resp = await fetchWithTimeout(getApiBase() + '/health', { method: 'GET' }, REQUEST_TIMEOUT_MS.health);
+    if (!resp.ok) throw new Error('API health check failed (HTTP ' + resp.status + ')');
+  }
+
   async function apiPost(path, body) {
-    var resp = await fetch(getApiBase() + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    var timeoutMs = path === '/parse' ? REQUEST_TIMEOUT_MS.parse : REQUEST_TIMEOUT_MS.default;
+    var resp = await fetchWithTimeout(getApiBase() + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, timeoutMs);
     if (!resp.ok) {
       if (resp.status === 404 && !getApiBase()) {
         throw new Error('HTTP 404 (API endpoint not found). In WordPress, set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
@@ -1009,7 +1109,8 @@
     return resp.json();
   }
   async function apiPostForm(path, formData) {
-    var resp = await fetch(getApiBase() + path, { method: 'POST', body: formData });
+    var timeoutMs = path === '/upload' ? REQUEST_TIMEOUT_MS.upload : REQUEST_TIMEOUT_MS.default;
+    var resp = await fetchWithTimeout(getApiBase() + path, { method: 'POST', body: formData }, timeoutMs);
     if (!resp.ok) {
       if (resp.status === 404 && !getApiBase()) {
         throw new Error('HTTP 404 (API endpoint not found). In WordPress, set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
@@ -1020,7 +1121,7 @@
     return resp.json();
   }
   async function apiPostBlob(path, body) {
-    var resp = await fetch(getApiBase() + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    var resp = await fetchWithTimeout(getApiBase() + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, REQUEST_TIMEOUT_MS.default);
     if (!resp.ok) {
       if (resp.status === 404 && !getApiBase()) {
         throw new Error('HTTP 404 (API endpoint not found). In WordPress, set window.QUOTE_ANALYZER_API_BASE to your backend URL.');
@@ -1075,8 +1176,11 @@
   /* ── Process Files ───────────────────────────────────────────────────── */
   window.processFiles = async function() {
     if (state.files.length === 0) return;
-    showLoading(true,'Uploading files…');
+    showLoading(true,'Connecting to API…');
     try {
+      await assertApiReachable();
+
+      showLoading(true,'Uploading files…');
       var formData = new FormData();
       state.files.forEach(function(f) { formData.append('files[]',f.file,f.name); });
       var uploadData = await apiPostForm('/upload',formData);
@@ -1091,15 +1195,72 @@
       showLoading(false);
       if (state.plans.length === 0) showToast('Files uploaded but no plans could be extracted.','warning');
       else showToast('✓ Extracted '+state.plans.length+' plan'+(state.plans.length!==1?'s':''),'success');
-    } catch(err) { showLoading(false); showToast('Upload/parse failed: '+err.message,'error'); }
+    } catch(err) { showLoading(false); showToast('Upload/parse failed: '+err.message+'. If this is a WordPress embed, verify window.QUOTE_ANALYZER_API_BASE and that the API is awake.','error'); }
   };
 
   /* ── Plans Table ─────────────────────────────────────────────────────── */
   var EDITABLE_COLS = ['carrier','planName','networkType','metalLevel','deductibleIndividual','oopMaxIndividual','copayPCP','premiumEE','premiumES','premiumEC','premiumEF'];
   function renderPlansTable(plans) {
+    var thead = document.getElementById('plansTableHead');
     var tbody = document.getElementById('plansTableBody');
     tbody.innerHTML = '';
-    if (plans.length===0) { tbody.innerHTML='<tr><td colspan="16" style="text-align:center;padding:24px;color:#7f8c8d">No plans extracted</td></tr>'; return; }
+
+    // Determine if current premiums are entered
+    var cp = state.currentPremiums || {};
+    var hasCurrentPremiums = cp.ee != null || cp.es != null || cp.ec != null || cp.ef != null;
+
+    // Build dynamic header
+    var headerCols = [
+      { col: '_select', label: '', sortable: false, cssClass: 'select-col', isCheckbox: true },
+      { col: 'carrier', label: 'Carrier', sortable: true },
+      { col: 'planName', label: 'Plan Name', sortable: true },
+      { col: 'networkType', label: 'Net', sortable: true },
+      { col: 'metalLevel', label: 'Metal', sortable: true },
+      { col: 'deductibleIndividual', label: 'Ded', sortable: true },
+      { col: 'oopMaxIndividual', label: 'OOP', sortable: true },
+      { col: 'copayPCP', label: 'PCP', sortable: true },
+      { col: 'premiumEE', label: 'EE', sortable: true },
+      { col: 'premiumES', label: 'ES', sortable: true },
+      { col: 'premiumEC', label: 'EC', sortable: true },
+      { col: 'premiumEF', label: 'EF', sortable: true },
+    ];
+    if (hasCurrentPremiums) {
+      headerCols.push({ col: '_deltaVsCurrent', label: 'Δ vs Current', sortable: false, cssClass: 'delta-col' });
+    }
+    headerCols.push(
+      { col: '_erPerPay', label: 'ER/Pay', sortable: false, cssClass: 'cost-col' },
+      { col: '_eePerPay', label: 'EE/Pay', sortable: false, cssClass: 'cost-col' },
+      { col: 'extractionConfidence', label: 'Conf', sortable: true },
+      { col: 'sourceFile', label: 'Src', sortable: false }
+    );
+
+    var headTr = document.createElement('tr');
+    headerCols.forEach(function(hc) {
+      var th = document.createElement('th');
+      if (hc.cssClass) th.className = hc.cssClass;
+      if (hc.isCheckbox) {
+        var selAllCb = document.createElement('input');
+        selAllCb.type = 'checkbox';
+        selAllCb.className = 'plan-select-cb';
+        selAllCb.id = 'selectAllPlans';
+        selAllCb.title = 'Select / deselect all (max 5)';
+        th.appendChild(selAllCb);
+      } else if (hc.sortable) {
+        th.className = (th.className ? th.className + ' ' : '') + 'sortable';
+        th.tabIndex = 0;
+        th.setAttribute('data-col', hc.col);
+        th.innerHTML = escHtml(hc.label) + ' <span class="sort-icon">↕</span>';
+      } else {
+        th.setAttribute('data-col', hc.col);
+        th.textContent = hc.label;
+      }
+      headTr.appendChild(th);
+    });
+    thead.innerHTML = '';
+    thead.appendChild(headTr);
+
+    var colCount = headerCols.length;
+    if (plans.length===0) { tbody.innerHTML='<tr><td colspan="'+colCount+'" style="text-align:center;padding:24px;color:#7f8c8d">No plans extracted</td></tr>'; return; }
     var fm = function(v) { return v!=null?'$'+Number(v).toLocaleString():'—'; };
     var fp = function(v) { return v!=null?'$'+Number(v).toFixed(2):'—'; };
     var fs = function(v) { return v||'—'; };
@@ -1124,11 +1285,36 @@
         {col:'premiumES',val:fp(plan.premiumES),ed:true},
         {col:'premiumEC',val:fp(plan.premiumEC),ed:true},
         {col:'premiumEF',val:fp(plan.premiumEF),ed:true},
+      ];
+
+      // Delta vs Current column
+      if (hasCurrentPremiums) {
+        var deltas = [];
+        COVERAGE_TIERS.forEach(function(tier) {
+          var currentVal = cp[tier];
+          var quotedVal = Number(plan[PREMIUM_KEY_BY_TIER[tier]]);
+          if (currentVal != null && Number.isFinite(quotedVal) && quotedVal > 0) {
+            deltas.push({ tier: tier, diff: quotedVal - currentVal, pct: ((quotedVal - currentVal) / currentVal) * 100 });
+          }
+        });
+        var deltaHtml = '—';
+        if (deltas.length > 0) {
+          var lines = deltas.map(function(d) {
+            var sign = d.diff > 0 ? '+' : '';
+            var cls = d.diff > 0 ? 'delta-positive' : d.diff < 0 ? 'delta-negative' : 'delta-zero';
+            return '<span class="'+cls+'">'+d.tier.toUpperCase()+': '+sign+'$'+Math.abs(d.diff).toFixed(2)+' ('+sign+d.pct.toFixed(1)+'%)</span>';
+          });
+          deltaHtml = lines.join('<br>');
+        }
+        cells.push({col:'_deltaVsCurrent',val:deltaHtml,ed:false,css:'delta-col'});
+      }
+
+      cells.push(
         {col:'_erPerPay',val:'<span class="er-cost">'+(contrib.employerPerPayTotal>0?fp(contrib.employerPerPayTotal):'—')+'</span>',ed:false,css:'cost-col'},
         {col:'_eePerPay',val:'<span class="ee-cost">'+(contrib.employeePerPayTotal>0?fp(contrib.employeePerPayTotal):'—')+'</span>',ed:false,css:'cost-col'},
         {col:'extractionConfidence',val:'<div class="confidence-bar-wrap"><div class="confidence-bar"><div class="confidence-bar-fill '+confClass+'" style="width:'+confPct+'%"></div></div><span style="font-size:0.75rem;color:#7f8c8d;min-width:32px">'+confPct+'%</span></div>',ed:false},
         {col:'sourceFile',val:'<span style="font-size:0.75rem;color:#7f8c8d" title="'+escHtml(plan.sourceFile||'')+'">'+escHtml(truncate(plan.sourceFile||'—',20))+'</span>',ed:false}
-      ];
+      );
       cells.forEach(function(c) {
         var td=document.createElement('td');
         if(c.css)td.className=c.css;
@@ -1230,6 +1416,21 @@
     renderPlansTable(state.plans);
   }
 
+  /* ── Current Premiums ─────────────────────────────────────────────── */
+  window.updateCurrentPremiums = function() {
+    var parse = function(id) {
+      var v = parseFloat(document.getElementById(id)?.value);
+      return Number.isFinite(v) && v > 0 ? v : null;
+    };
+    state.currentPremiums = {
+      ee: parse('currentPremiumEE'),
+      es: parse('currentPremiumES'),
+      ec: parse('currentPremiumEC'),
+      ef: parse('currentPremiumEF'),
+    };
+    if(state.plans.length>0)renderPlansTable(state.plans);
+  };
+
   /* ── Census ──────────────────────────────────────────────────────────── */
   window.updateCensus = function() {
     state.census = {
@@ -1295,7 +1496,7 @@
     if(state.plans.length===0){showToast('No plans to score','warning');return;}
     showLoading(true,'Scoring plans…');
     try {
-      var data=await apiPost('/recommend',{caseId:state.caseId,census:state.census,contribution:state.contribution});
+      var data=await apiPost('/recommend',{caseId:state.caseId,census:state.census,contribution:state.contribution,currentPremiums:state.currentPremiums});
       state.recommendations=data;renderRecommendations(data);showSection('recommendationsSection',true);showSection('outputsSection',true);
       showLoading(false);showToast('✓ Recommendations generated for '+data.recommendations.length+' top plans','success');
     } catch(err){showLoading(false);showToast('Recommendations failed: '+err.message,'error');}
@@ -1345,7 +1546,7 @@
     if(!state.caseId){showToast('No case loaded','warning');return;}
     showLoading(true,'Building PowerPoint…');
     try {
-      var body={caseId:state.caseId,clientName:document.getElementById('clientName').value||'Client',effectiveDate:document.getElementById('effectiveDate').value||'',contribution:state.contribution};
+      var body={caseId:state.caseId,clientName:document.getElementById('clientName').value||'Client',effectiveDate:document.getElementById('effectiveDate').value||'',contribution:state.contribution,currentPremiums:state.currentPremiums};
       if(state.selectedPlanIndices.length>0)body.selectedPlanIndices=state.selectedPlanIndices;
       var r=await apiPostBlob('/export/pptx',body);
       triggerDownload(r.blob,r.filename||'BenefitsAnalysis.pptx');showLoading(false);
@@ -1356,7 +1557,7 @@
     if(!state.caseId){showToast('No case loaded','warning');return;}
     showLoading(true,'Building Excel workbook…');
     try {
-      var r=await apiPostBlob('/export/xlsx',{caseId:state.caseId,clientName:document.getElementById('clientName').value||'Client',effectiveDate:document.getElementById('effectiveDate').value||'',contribution:state.contribution});
+      var r=await apiPostBlob('/export/xlsx',{caseId:state.caseId,clientName:document.getElementById('clientName').value||'Client',effectiveDate:document.getElementById('effectiveDate').value||'',contribution:state.contribution,currentPremiums:state.currentPremiums});
       triggerDownload(r.blob,r.filename||'BenefitsAnalysis.xlsx');showLoading(false);showToast('✓ Excel downloaded','success');
     } catch(err){showLoading(false);showToast('XLSX failed: '+err.message,'error');}
   };
@@ -1385,6 +1586,7 @@
 
   /* ── Init ─────────────────────────────────────────────────────────────── */
   updateCensus();
+  updateCurrentPremiums();
   updateContributionSettings();
   renderContributionSummary();
   showSection('plansSection',false);

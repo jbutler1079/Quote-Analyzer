@@ -90,10 +90,49 @@
       </div>
     </section>
 
+    <!-- Section: Current Premium Amounts -->
+    <section class="card" id="currentPremiumsSection">
+      <h2 class="card-title">
+        <span class="step-badge">3</span>
+        Current Premium Amounts
+      </h2>
+      <p class="section-hint">Enter the client's current monthly premium rates per tier. These will be compared against quoted rates to show savings or increases.</p>
+      <div class="current-premiums-grid">
+        <div class="current-premium-group">
+          <label for="currentPremiumEE">EE Only <span class="census-label-sub">Employee Only</span></label>
+          <div class="input-with-prefix">
+            <span class="input-prefix">$</span>
+            <input type="number" id="currentPremiumEE" min="0" step="0.01" placeholder="0.00" class="premium-input" oninput="updateCurrentPremiums()" />
+          </div>
+        </div>
+        <div class="current-premium-group">
+          <label for="currentPremiumES">EE + Spouse <span class="census-label-sub">Emp + Spouse</span></label>
+          <div class="input-with-prefix">
+            <span class="input-prefix">$</span>
+            <input type="number" id="currentPremiumES" min="0" step="0.01" placeholder="0.00" class="premium-input" oninput="updateCurrentPremiums()" />
+          </div>
+        </div>
+        <div class="current-premium-group">
+          <label for="currentPremiumEC">EE + Child(ren) <span class="census-label-sub">Emp + Child(ren)</span></label>
+          <div class="input-with-prefix">
+            <span class="input-prefix">$</span>
+            <input type="number" id="currentPremiumEC" min="0" step="0.01" placeholder="0.00" class="premium-input" oninput="updateCurrentPremiums()" />
+          </div>
+        </div>
+        <div class="current-premium-group">
+          <label for="currentPremiumEF">Family <span class="census-label-sub">Family</span></label>
+          <div class="input-with-prefix">
+            <span class="input-prefix">$</span>
+            <input type="number" id="currentPremiumEF" min="0" step="0.01" placeholder="0.00" class="premium-input" oninput="updateCurrentPremiums()" />
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- Section: Census -->
     <section class="card" id="censusSection">
       <h2 class="card-title">
-        <span class="step-badge">3</span>
+        <span class="step-badge">4</span>
         Census
       </h2>
       <div class="census-grid">
@@ -128,7 +167,7 @@
     <!-- Section: Employer Contribution Setup -->
     <section class="card" id="contributionSection">
       <h2 class="card-title">
-        <span class="step-badge">4</span>
+        <span class="step-badge">5</span>
         Employer Contribution Setup
       </h2>
       <p class="section-hint">Set employer contribution rules and payroll frequency to calculate employer vs employee per-pay-period amounts.</p>
@@ -183,32 +222,14 @@
     <!-- Section: Extracted Plans -->
     <section class="card hidden" id="plansSection">
       <h2 class="card-title">
-        <span class="step-badge">5</span>
+        <span class="step-badge">6</span>
         Extracted Plans
         <span class="badge-count" id="plansCount">0</span>
       </h2>
       <p class="section-hint">Click any cell to edit extracted values before generating recommendations.</p>
       <div class="table-wrapper" role="region" aria-label="Extracted plans table" tabindex="0">
         <table class="plans-table" id="plansTable">
-          <thead>
-            <tr>
-              <th data-col="carrier" class="sortable" tabindex="0">Carrier <span class="sort-icon">↕</span></th>
-              <th data-col="planName" class="sortable" tabindex="0">Plan <span class="sort-icon">↕</span></th>
-              <th data-col="networkType" class="sortable" tabindex="0">Net <span class="sort-icon">↕</span></th>
-              <th data-col="metalLevel" class="sortable" tabindex="0">Metal <span class="sort-icon">↕</span></th>
-              <th data-col="deductibleIndividual" class="sortable" tabindex="0">Ded <span class="sort-icon">↕</span></th>
-              <th data-col="oopMaxIndividual" class="sortable" tabindex="0">OOP <span class="sort-icon">↕</span></th>
-              <th data-col="copayPCP" class="sortable" tabindex="0">PCP <span class="sort-icon">↕</span></th>
-              <th data-col="premiumEE" class="sortable" tabindex="0">EE <span class="sort-icon">↕</span></th>
-              <th data-col="premiumES" class="sortable" tabindex="0">ES <span class="sort-icon">↕</span></th>
-              <th data-col="premiumEC" class="sortable" tabindex="0">EC <span class="sort-icon">↕</span></th>
-              <th data-col="premiumEF" class="sortable" tabindex="0">EF <span class="sort-icon">↕</span></th>
-              <th class="cost-col">ER/Pay</th>
-              <th class="cost-col">EE/Pay</th>
-              <th data-col="extractionConfidence" class="sortable" tabindex="0">Conf <span class="sort-icon">↕</span></th>
-              <th>Src</th>
-            </tr>
-          </thead>
+          <thead id="plansTableHead"></thead>
           <tbody id="plansTableBody"></tbody>
         </table>
       </div>
@@ -217,7 +238,7 @@
     <!-- Section: Recommendations -->
     <section class="card hidden" id="recommendationsSection">
       <h2 class="card-title">
-        <span class="step-badge">6</span>
+        <span class="step-badge">7</span>
         Top Recommendations
       </h2>
       <div class="rec-cards" id="recCards"></div>
@@ -226,7 +247,7 @@
     <!-- Section: Generate Outputs -->
     <section class="card hidden" id="outputsSection">
       <h2 class="card-title">
-        <span class="step-badge">7</span>
+        <span class="step-badge">8</span>
         Generate Outputs
       </h2>
       <p class="section-hint">Download the analysis as a presentation or spreadsheet for client delivery.</p>
