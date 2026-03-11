@@ -651,8 +651,10 @@ function extractByPlanNames(text, lines, sourceFile) {
     const { name, lineIndex } = uniqueNames[u];
     // Context: from this plan name to the next plan name (or end of text)
     const nextLineIndex = u + 1 < uniqueNames.length ? uniqueNames[u + 1].lineIndex : lines.length;
-    // Also look a few lines before the plan name for context
-    const startLine = Math.max(0, lineIndex - 2);
+    // Look a few lines before the plan name for context (carrier info, etc.)
+    // For the first plan, look back up to 2 lines. For subsequent plans, only start
+    // at the plan name line itself to avoid capturing data from the prior plan block.
+    const startLine = u === 0 ? Math.max(0, lineIndex - 2) : lineIndex;
     const blockLines = lines.slice(startLine, nextLineIndex);
     const blockText = blockLines.join('\n');
 
