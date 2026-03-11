@@ -331,7 +331,7 @@ async function extractWithLLM(text, sourceFile) {
   if (!apiKey) return null; // No key = skip LLM strategy
 
   const model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
-  const client = new OpenAI({ apiKey });
+  const client = new OpenAI({ apiKey, timeout: 25000 });
 
   // Truncate to fit context window (reserve ~4K for prompt + response structure)
   // gpt-4o-mini: 128K context; gpt-4o: 128K context
@@ -646,14 +646,27 @@ async function extractPlanFromText(text, sourceFile) {
   } catch (e) { console.log(`[EXTRACT] Strategy 12 error: ${e.message}`); }
 
   // ── Strategy 13: LLM Universal Extractor ──────────────────────────────────
-  // Runs in parallel with regex strategies. Only active when OPENAI_API_KEY is set.
+  // Smart fallback: only calls the LLM when regex strategies produced poor results.
+  // This avoids adding 10-30s of latency when regex already found good data.
   try {
     if (process.env.OPENAI_API_KEY) {
-      const llmPlans = await extractWithLLM(text, sourceFile);
-      if (llmPlans && llmPlans.length > 0) {
-        const score = scoreStrategyResult(llmPlans) + 0.1;
-        console.log(`[EXTRACT] Strategy 13 (LLM universal): ${llmPlans.length} plans, score=${score}`);
-        candidates.push({ name: 'LLM universal', plans: llmPlans, score });
+      const bestRegexScore = candidates.length > 0
+        ? Math.max(...candidates.map(c => c.score))
+        : 0;
+      const bestRegexPlans = candidates.length > 0
+        ? Math.max(...candidates.map(c => c.plans.length))
+        : 0;
+      // Only call LLM if: no plans found, or best regex score is weak (< 20 = few plans with few fields)
+      if (bestRegexPlans === 0 || bestRegexScore < 20) {
+        console.log(`[LLM] Regex best: ${bestRegexPlans} plans, score=${bestRegexScore.toFixed(1)} — invoking LLM fallback`);
+        const llmPlans = await extractWithLLM(text, sourceFile);
+        if (llmPlans && llmPlans.length > 0) {
+          const score = scoreStrategyResult(llmPlans) + 0.1;
+          console.log(`[EXTRACT] Strategy 13 (LLM universal): ${llmPlans.length} plans, score=${score}`);
+          candidates.push({ name: 'LLM universal', plans: llmPlans, score });
+        }
+      } else {
+        console.log(`[LLM] Regex found ${bestRegexPlans} plans with score=${bestRegexScore.toFixed(1)} — skipping LLM`);
       }
     }
   } catch (e) { console.log(`[EXTRACT] Strategy 13 error: ${e.message}`); }
