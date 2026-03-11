@@ -158,7 +158,7 @@ const upload = multer({
 // ── Auth middleware (disabled – internal tool) ───────────────────────────────
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'bcbs-uhc-strategy14-v4', strategies: 14 }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'bcbs-uhc-strategy14-v5', strategies: 14 }));
 
 // ── Debug: last extraction info ───────────────────────────────────────────────
 app.get('/debug/lastextract', (_req, res) => {
@@ -2563,13 +2563,14 @@ function extractByRepeatedKeywords(text, lines, sourceFile) {
 
   // Benefit keywords to look for — each may appear once per plan
   const benefitDefs = [
-    { field: 'deductibleIndividual', re: /deductible/i, exclude: /family|rx|pharm|drug/i },
-    { field: 'oopMaxIndividual', re: /out[\s-]*of[\s-]*pocket|oop|moop/i, exclude: /family/i },
-    { field: 'copayPCP', re: /pcp|primary\s*care|office\s*visit/i },
-    { field: 'copaySpecialist', re: /specialist/i },
-    { field: 'copayER', re: /emergency/i },
+    { field: 'deductibleIndividual', re: /(?:annual\s*)?deductible/i, exclude: /family|rx|pharm|drug/i },
+    { field: 'oopMaxIndividual', re: /out[\s-]*of[\s-]*pocket(?:\s*(?:max|limit))?|oop|moop/i, exclude: /family/i },
+    { field: 'copayPCP', re: /pcp|primary\s*care|office\s*visit[\s\-–—]*primary/i },
+    { field: 'copaySpecialist', re: /specialist|office\s*visit[\s\-–—]*specialist/i },
+    { field: 'copayER', re: /emergency\s*(?:room)?\s*(?:services?)?/i },
+    { field: 'copayUrgentCare', re: /urgent\s*care/i },
     { field: 'premiumEE', re: /employee\s*only|emp\s*only|\bee\b(?!\+)|single/i, exclude: /spouse|child|family/i },
-    { field: 'premiumES', re: /emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp)|\bes\b/i },
+    { field: 'premiumES', re: /emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp)|(?<![a-zA-Z])es(?![a-zA-Z])/i },
     { field: 'premiumEC', re: /emp(?:loyee)?\s*[\+\/&]\s*(?:child|ch)|\bec\b/i },
     { field: 'premiumEF', re: /\bfamily\b|\bef\b/i, exclude: /deductible|oop|out.of.pocket|family.*deductible/i },
   ];
@@ -2674,7 +2675,7 @@ function extractFromBenefitGrid(text, sourceFile) {
 
   // Identify "benefit label" lines that contain both a recognizable label
   // and at least one dollar amount.
-  const BENEFIT_LABEL_RE = /deductible|out[\s-]*of[\s-]*pocket|oop|copay|co-?pay|coinsurance|premium|office\s*visit|pcp|primary\s*care|specialist|emergency|urgent\s*care|generic|preferred\s*brand|non[\s-]*preferred|tier\s*[123]|rx|pharmacy|moop|max(?:imum)?\s*out/i;
+  const BENEFIT_LABEL_RE = /deductible|out[\s-]*of[\s-]*pocket|oop|copay|co-?pay|coinsurance|premium|office\s*visit|pcp|primary\s*care|specialist|emergency|urgent\s*care|generic|preferred\s*brand|non[\s-]*preferred|tier\s*[123]|rx|pharmacy|moop|max(?:imum)?\s*out|retail\s*(?:generic|preferred|non)/i;
   const DOLLAR_RE = /\$\s*[\d,]+(?:\.\d{1,2})?/g;
   const TIER_LABEL_RE = /\b(?:employee\s*only|emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp|child(?:ren)?|ch|family|fam)|single|ee|es|ec|ef|family)\b/i;
 
@@ -2933,40 +2934,53 @@ function enrichPlansFromText(plans, fullText) {
       /deductible\s*(?:\([^)]*\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*(?:\/\s*\$?[\d,]+)?(?:\s*(?:individual|person|member|single))?/i,
       /(?:in[\s-]?network|medical)\s*deductible\s*[:\-·.…]*\s*\$?([\d,]+)/i,
       /deductible[^$\n]{0,40}\$\s*([\d,]+)/i,
+      /(?:annual\s*)?deductible[\s\S]{0,60}\$\s*([\d,]+)\s*individual/i,
     ]},
     { field: 'deductibleFamily', patterns: [
       /family\s*deductible\s*[:\-]?\s*\$?([\d,]+)/i,
       /deductible[^$\n]*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
       /deductible\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+      /(?:annual\s*)?deductible[\s\S]{0,80}\$[\d,]+\s*individual\s*\/\s*\$\s*([\d,]+)\s*family/i,
+      /deductible[\s\S]{0,60}\$[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
     ]},
     { field: 'oopMaxIndividual', patterns: [
-      /(?:individual|in[\s-]?network)\s*(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-]?\s*\$?([\d,]+)/i,
-      /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*(?:\([^)]*\))?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
-      /(?:max(?:imum)?\s*)?out[\s-]*of[\s-]*pocket\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+      /(?:individual|in[\s-]?network)\s*(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*[:\-]?\s*\$?([\d,]+)/i,
+      /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*(?:\([^)]*\))?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+      /(?:max(?:imum)?\s*)?out[\s-]*of[\s-]*pocket\s*(?:max(?:imum)?|limit)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
       /moop\s*[:\-·.…]*\s*\$?([\d,]+)/i,
       /oop[^$\n]{0,40}\$\s*([\d,]+)/i,
+      /(?:annual\s*)?out[\s-]*of[\s-]*pocket\s*(?:max(?:imum)?|limit)?[\s\S]{0,60}\$\s*([\d,]+)\s*individual/i,
     ]},
     { field: 'oopMaxFamily', patterns: [
-      /family\s*(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-]?\s*\$?([\d,]+)/i,
+      /family\s*(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*[:\-]?\s*\$?([\d,]+)/i,
       /(?:out[\s-]*of[\s-]*pocket|oop)[^$\n]*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
-      /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+      /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+      /(?:annual\s*)?out[\s-]*of[\s-]*pocket\s*(?:max(?:imum)?|limit)?[\s\S]{0,80}\$[\d,]+\s*individual\s*\/\s*\$\s*([\d,]+)\s*family/i,
+      /(?:out[\s-]*of[\s-]*pocket|oop)[\s\S]{0,60}\$[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
     ]},
     { field: 'copayPCP', patterns: [
       /(?:pcp|primary\s*care|office\s*visit|doctor|physician)\s*(?:copay?|co[\s-]?pay(?:ment)?|visit)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
       /(?:pcp|office\s*visit|primary\s*care)\s*[:\-·.…]*\s*\$?([\d]+)/i,
+      /office\s*visit\s*[\-–—]\s*primary\s*care[\s\S]{0,20}\$\s*([\d]+)/i,
+      /primary\s*care\s*(?:visit)?\s*[\n\r]\s*\$\s*([\d]+)/i,
     ]},
     { field: 'copaySpecialist', patterns: [
       /specialist\s*(?:copay?|co[\s-]?pay(?:ment)?|visit)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+      /office\s*visit\s*[\-–—]\s*specialist[\s\S]{0,20}\$\s*([\d]+)/i,
+      /specialist\s*(?:visit)?\s*[\n\r]\s*\$\s*([\d]+)/i,
     ]},
     { field: 'copayER', patterns: [
       /(?:emergency\s*(?:room|dept|department|services?)|er\b)\s*(?:copay?|co[\s-]?pay(?:ment)?)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+      /emergency\s*(?:room)?\s*(?:services?)?\s*[\n\r]\s*\$\s*([\d]+)/i,
     ]},
     { field: 'copayUrgentCare', patterns: [
       /urgent\s*care\s*(?:copay?|co[\s-]?pay(?:ment)?)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
+      /urgent\s*care\s*[\n\r]\s*\$\s*([\d]+)/i,
     ]},
     { field: 'coinsurance', patterns: [
       /coinsurance\s*[:\-·.…]*\s*(\d+)\s*%/i,
       /(\d+)\s*%\s*(?:co[\s-]?insurance|after\s+deductible)/i,
+      /coinsurance\s*(?:\(in[\s-]?network\))?\s*[\n\r]\s*(\d+%)/i,
     ]},
   ];
 
@@ -3068,7 +3082,7 @@ function normalizeCarrier(raw) {
   if (!raw) return null;
   const up = raw.replace(/\s+/g, ' ').trim();
   if (/bcbs|blue\s*cross/i.test(up)) return 'BCBS';
-  if (/united\s*health/i.test(up)) return 'UnitedHealthcare';
+  if (/uhc\b|united\s*health/i.test(up)) return 'UnitedHealthcare';
   if (/baylor|bsw/i.test(up)) return 'Baylor Scott & White';
   return up.charAt(0).toUpperCase() + up.slice(1);
 }
@@ -3108,17 +3122,17 @@ function extractFromRateTable(lines, sourceFile) {
 
   // Benefit label patterns for benefit rows in rate tables
   const benefitLabels = {
-    deductibleIndividual: /\bdeductible\b(?!.*family)/i,
-    deductibleFamily: /\bdeductible\b.*family/i,
-    oopMaxIndividual: /\b(?:out[\s-]*of[\s-]*pocket|oop|moop)\b(?!.*family)/i,
-    oopMaxFamily: /\b(?:out[\s-]*of[\s-]*pocket|oop|moop)\b.*family/i,
-    copayPCP: /\b(?:pcp|primary\s*care|office\s*visit|doctor\s*visit|physician)\b/i,
-    copaySpecialist: /\bspecialist\b/i,
-    copayER: /\b(?:emergency|er\b)/i,
+    deductibleIndividual: /\b(?:annual\s*)?deductible\b(?!.*family)/i,
+    deductibleFamily: /\b(?:annual\s*)?deductible\b.*family/i,
+    oopMaxIndividual: /\b(?:out[\s-]*of[\s-]*pocket|oop|moop)\b(?:\s*(?:max|limit))?(?!.*family)/i,
+    oopMaxFamily: /\b(?:out[\s-]*of[\s-]*pocket|oop|moop)\b(?:\s*(?:max|limit))?.*family/i,
+    copayPCP: /\b(?:pcp|primary\s*care|office\s*visit(?:\s*[\-–—]\s*primary)?|doctor\s*visit|physician)\b/i,
+    copaySpecialist: /\b(?:specialist|office\s*visit\s*[\-–—]\s*specialist)\b/i,
+    copayER: /\b(?:emergency(?:\s*room)?(?:\s*services?)?|er\b)/i,
     copayUrgentCare: /\burgent\s*care\b/i,
-    rxTier1: /\b(?:generic|tier\s*1)\b/i,
-    rxTier2: /\b(?:preferred\s*brand|tier\s*2)\b/i,
-    rxTier3: /\b(?:non[\s-]*preferred|tier\s*3|specialty)\b/i,
+    rxTier1: /\b(?:generic|tier\s*1|retail\s*generic)\b/i,
+    rxTier2: /\b(?:preferred\s*brand|tier\s*2|retail\s*preferred)\b/i,
+    rxTier3: /\b(?:non[\s-]*preferred|tier\s*3|specialty|retail\s*non)\b/i,
     coinsurance: /\bcoinsurance\b/i,
   };
 
@@ -3431,9 +3445,9 @@ function extractFieldsFromBlock(text, sourceFile) {
   // Plan name — broadened
   const planName = get([
     /(?:plan\s*name|plan\s*title|plan\s*option|plan\s*design)\s*[:\-]\s*([^\n]{3,70})/i,
-    /([A-Za-z][A-Za-z0-9\s\/\-&']*(?:HMO|PPO|EPO|HDHP|HSA)[A-Za-z0-9\s\/\-&']{0,40})/i,
-    /([A-Za-z][A-Za-z0-9\s\/\-&']*(?:Gold|Silver|Bronze|Platinum)[A-Za-z0-9\s\/\-&']{0,40})/i,
-    /([A-Za-z][A-Za-z0-9\s\/\-&']*(?:Plus|Choice|Select|Value|Preferred|Essential|Core|Standard|Basic|Premier)[A-Za-z0-9\s\/\-&']{0,40})/i,
+    /([A-Za-z][A-Za-z0-9 \/\-&']*(?:HMO|PPO|EPO|HDHP|HSA)[A-Za-z0-9 \/\-&']{0,40})/i,
+    /([A-Za-z][A-Za-z0-9 \/\-&']*(?:Gold|Silver|Bronze|Platinum)[A-Za-z0-9 \/\-&']{0,40})/i,
+    /([A-Za-z][A-Za-z0-9 \/\-&']*(?:Plus|Choice|Select|Value|Preferred|Essential|Core|Standard|Basic|Premier)[A-Za-z0-9 \/\-&']{0,40})/i,
   ]);
 
   // Network type
@@ -3455,6 +3469,8 @@ function extractFieldsFromBlock(text, sourceFile) {
     /deductible\s*(?:\(individual\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*[\/|]\s*\$?[\d,]+/i,
     /(?:in[\s-]?network\s+)?(?:medical\s+)?deductible\s*(?:\((?:individual|in[\s-]?network)\))?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
     /\$\s*([\d,]+)\s*(?:individual\s+)?deductible/i,
+    // Cross-line: "Deductible\n...\n$X Individual" or "Annual Deductible\nIn-Network\n$X Individual"
+    /(?:annual\s*)?deductible[\s\S]{0,60}\$\s*([\d,]+)\s*individual/i,
     /deductible[^$\n]{0,50}\$\s*([\d,]+)/i,
     /ded(?:uctible)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
   ]));
@@ -3466,6 +3482,10 @@ function extractFieldsFromBlock(text, sourceFile) {
     /deductible[^$\n]*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
     // Handle "(Individual/Family): $X / $Y"
     /deductible\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+    // Cross-line: "Deductible\n...\n$X Individual / $Y Family"
+    /(?:annual\s*)?deductible[\s\S]{0,80}\$[\d,]+\s*individual\s*\/\s*\$\s*([\d,]+)\s*family/i,
+    // "$X Individual / $Y Family" on any line after deductible (cross-line)
+    /deductible[\s\S]{0,60}\$[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
   ]));
 
   // ── Out-of-Pocket Max — expanded patterns ────────────────────────────────
@@ -3473,23 +3493,28 @@ function extractFieldsFromBlock(text, sourceFile) {
   //          "Maximum Out of Pocket $6,000 / $12,000", "MOOP: $6,000",
   //          "Individual OOP Max $6,000", "$6,000 Out of Pocket Maximum"
   const oopMaxIndividual = parseMoney(get([
-    /individual\s+(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
-    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-]?\s*(?:individual|in[\s-]?network)\s*[:\-·.…]*\s*\$?([\d,]+)/i,
-    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*(?:\(individual\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*(?:individual|per\s*person|person|member|single)/i,
-    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*(?:\(individual\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*[\/|]\s*\$?[\d,]+/i,
-    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*(?:\([^)]*\))?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
-    /(?:max(?:imum)?\s*)?out[\s-]*of[\s-]*pocket\s*(?:max(?:imum)?)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /individual\s+(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*[:\-]?\s*(?:individual|in[\s-]?network)\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*(?:\(individual\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*(?:individual|per\s*person|person|member|single)/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*(?:\(individual\))?\s*[:\-·.…]*\s*\$?([\d,]+)\s*[\/|]\s*\$?[\d,]+/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*(?:\([^)]*\))?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /(?:max(?:imum)?\s*)?out[\s-]*of[\s-]*pocket\s*(?:max(?:imum)?|limit)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
     /\$\s*([\d,]+)\s*(?:individual\s+)?(?:out[\s-]*of[\s-]*pocket|oop)/i,
     /moop\s*[:\-·.…]*\s*\$?([\d,]+)/i,
     /oop[^$\n]{0,50}\$\s*([\d,]+)/i,
+    // Cross-line: "Out-of-Pocket Limit\n...\n$X Individual"
+    /(?:annual\s*)?out[\s-]*of[\s-]*pocket\s*(?:max(?:imum)?|limit)?[\s\S]{0,60}\$\s*([\d,]+)\s*individual/i,
   ]));
 
   const oopMaxFamily = parseMoney(get([
-    /family\s+(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
+    /family\s+(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*[:\-·.…]*\s*\$?([\d,]+)/i,
     // "$X / $Y" pair — capture Y (family). Must have $ before both X and Y.
     /(?:out[\s-]*of[\s-]*pocket|oop)[^$\n]*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
     // Handle "(Individual/Family): $X / $Y"
-    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?)?\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)\s*(?:max(?:imum)?|limit)?\s*\([^)]*\)\s*[:\-·.…]*\s*\$\s*[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
+    // Cross-line: "Out-of-Pocket Limit\n...\n$X Individual / $Y Family"
+    /(?:annual\s*)?out[\s-]*of[\s-]*pocket\s*(?:max(?:imum)?|limit)?[\s\S]{0,80}\$[\d,]+\s*individual\s*\/\s*\$\s*([\d,]+)\s*family/i,
+    /(?:out[\s-]*of[\s-]*pocket|oop)[\s\S]{0,60}\$[\d,]+(?:\.\d+)?\s*[\/|]\s*\$\s*([\d,]+)/i,
   ]));
 
   // Coinsurance
@@ -3497,6 +3522,7 @@ function extractFieldsFromBlock(text, sourceFile) {
     /coinsurance\s*[:\-·.…]*\s*(\d+%(?:\s*[\/\-]\s*\d+%)?)/i,
     /(\d+%)\s*(?:co[\s-]?insurance|after\s+deductible)/i,
     /(?:you\s+pay|member\s+pays?|plan\s+pays?)\s*[:\-]?\s*(\d+%)/i,
+    /coinsurance\s*(?:\(in[\s-]?network\))?\s*[\n\r]\s*(\d+%)/i,
   ]);
 
   // ── Copays — expanded patterns ──────────────────────────────────────────
@@ -3508,23 +3534,35 @@ function extractFieldsFromBlock(text, sourceFile) {
     /(?:pcp|office\s*visit|primary\s*care)\s*[:\-·.…]*\s*\$?([\d]+)/i,
     /\$\s*([\d]+)\s*(?:pcp|office\s*visit|primary\s*care)/i,
     /(?:pcp|primary\s*care|office\s*visit)[^$\n]{0,30}\$\s*([\d]+)/i,
+    // "Office Visit - Primary Care\n$30 copay" (UHC format)
+    /office\s*visit\s*[\-–—]\s*primary\s*care[\s\S]{0,20}\$\s*([\d]+)/i,
+    // Cross-line: "Primary Care Visit\n$30 copay"
+    /primary\s*care\s*(?:visit)?\s*[\n\r]\s*\$\s*([\d]+)/i,
   ]));
 
   const copaySpecialist = parseMoney(get([
     /specialist\s*(?:copay?|co[\s-]?pay(?:ment)?|visit)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
     /(?:copay?|co[\s-]?pay)\s*[:\-]?\s*\$?([\d]+)\s*(?:specialist)/i,
     /specialist[^$\n]{0,30}\$\s*([\d]+)/i,
+    // "Office Visit - Specialist\n$50 copay" (UHC format)
+    /office\s*visit\s*[\-–—]\s*specialist[\s\S]{0,20}\$\s*([\d]+)/i,
+    // Cross-line: "Specialist Visit\n$50 copay"
+    /specialist\s*(?:visit)?\s*[\n\r]\s*\$\s*([\d]+)/i,
   ]));
 
   const copayUrgentCare = parseMoney(get([
     /urgent\s*care\s*(?:copay?|co[\s-]?pay(?:ment)?)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
     /urgent\s*care[^$\n]{0,30}\$\s*([\d]+)/i,
+    // Cross-line: "Urgent Care\n$75 copay"
+    /urgent\s*care\s*[\n\r]\s*\$\s*([\d]+)/i,
   ]));
 
   const copayER = parseMoney(get([
     /(?:emergency\s*(?:room|dept|department|services?)|er)\s*(?:copay?|co[\s-]?pay(?:ment)?)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
     /(?:copay?|co[\s-]?pay)\s*[:\-]?\s*\$?([\d]+)\s*(?:emergency|er\b)/i,
     /emergency[^$\n]{0,30}\$\s*([\d]+)/i,
+    // Cross-line: "Emergency Room Services\n$350 copay" or "Emergency Room\n$500 copay"
+    /emergency\s*(?:room)?\s*(?:services?)?\s*[\n\r]\s*\$\s*([\d]+)/i,
   ]));
 
   // ── Rx / Pharmacy ──────────────────────────────────────────────────────
@@ -3534,14 +3572,17 @@ function extractFieldsFromBlock(text, sourceFile) {
   const rxTier1 = parseMoney(get([
     /(?:generic|tier\s*(?:1|i)\b|tier1)\s*(?:rx|drug|copay?|co[\s-]?pay)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
     /(?:generic|tier\s*1)[^$\n]{0,30}\$\s*([\d]+)/i,
+    /retail\s*generic\s*[:\-·.…]*\s*\$?([\d]+)/i,
   ]));
   const rxTier2 = parseMoney(get([
     /(?:preferred\s*brand|tier\s*(?:2|ii)\b|tier2)\s*(?:rx|drug|copay?|co[\s-]?pay)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
     /(?:preferred\s*brand|tier\s*2)[^$\n]{0,30}\$\s*([\d]+)/i,
+    /retail\s*preferred\s*brand\s*[:\-·.…]*\s*\$?([\d]+)/i,
   ]));
   const rxTier3 = parseMoney(get([
     /(?:non[\s-]?preferred\s*brand|tier\s*(?:3|iii)\b|tier3|specialty)\s*(?:rx|drug|copay?|co[\s-]?pay)?\s*[:\-·.…]*\s*\$?([\d]+)/i,
     /(?:non[\s-]?preferred|tier\s*3|specialty)[^$\n]{0,30}\$\s*([\d]+)/i,
+    /retail\s*non[\s-]?preferred\s*[:\-·.…]*\s*\$?([\d]+)/i,
   ]));
 
   // ── Premiums — expanded patterns ───────────────────────────────────────
@@ -3555,9 +3596,11 @@ function extractFieldsFromBlock(text, sourceFile) {
   ]));
 
   const premiumES = parseMoney(get([
-    /(?:emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp)|emp\s*spouse|ee\s*[\+\/&]\s*sp|es\b|employee\s*[\+\/&\s]\s*spouse|emp(?:loyee)?\/spouse)\s*(?:monthly\s*)?(?:premium|rate|cost)?\s*[:\-·.…]*\s*\$?([\d,]+\.?\d*)/i,
-    /(?:employee\s*[\+\/&]\s*spouse|emp\+sp|ee\+sp|es)\s+\$?([\d,]+\.\d{2})/i,
-    /(?:emp(?:loyee)?\s*[\+\/&]\s*spouse|es)[^$\n]{0,30}\$\s*([\d,]+\.\d{2})/i,
+    /(?:emp(?:loyee)?\s*[\+\/&]\s*(?:spouse|sp)|emp\s*spouse|ee\s*[\+\/&]\s*sp|employee\s*[\+\/&\s]\s*spouse|emp(?:loyee)?\/spouse)\s*(?:monthly\s*)?(?:premium|rate|cost)?\s*[:\-·.…]*\s*\$?([\d,]+\.?\d*)/i,
+    /(?:employee\s*[\+\/&]\s*spouse|emp\+sp|ee\+sp)\s+\$?([\d,]+\.\d{2})/i,
+    /(?:emp(?:loyee)?\s*[\+\/&]\s*spouse)[^$\n]{0,30}\$\s*([\d,]+\.\d{2})/i,
+    // Standalone "ES" label — use lookaround to avoid matching "ServiceS"
+    /(?<![a-zA-Z])es(?![a-zA-Z])\s*[:\-·.…]*\s*\$?([\d,]+\.\d{2})/i,
   ]));
 
   const premiumEC = parseMoney(get([
@@ -3567,9 +3610,10 @@ function extractFieldsFromBlock(text, sourceFile) {
   ]));
 
   const premiumEF = parseMoney(get([
-    /(?:family|emp(?:loyee)?\s*[\+\/&]\s*(?:family|fam)|ee\s*[\+\/&]\s*fam|ef\b|employee\s*[\+\/&\s]\s*family|emp(?:loyee)?\/family)\s*(?:monthly\s*)?(?:premium|rate|cost)?\s*[:\-·.…]*\s*\$?([\d,]+\.?\d*)/i,
-    /(?:employee\s*[\+\/&]\s*family|family|emp\+fam|ee\+fam|ef)\s+\$?([\d,]+\.\d{2})/i,
-    /(?:family|ef)[^$\n]{0,30}\$\s*([\d,]+\.\d{2})/i,
+    /(?:emp(?:loyee)?\s*[\+\/&]\s*(?:family|fam)|ee\s*[\+\/&]\s*fam|ef\b|employee\s*[\+\/&\s]\s*family|emp(?:loyee)?\/family)\s*(?:monthly\s*)?(?:premium|rate|cost)?\s*[:\-·.…]*\s*\$?([\d,]+\.?\d*)/i,
+    /(?:employee\s*[\+\/&]\s*family|emp\+fam|ee\+fam|ef)\s+\$?([\d,]+\.\d{2})/i,
+    /\bfamily\s*(?:monthly\s*)?(?:premium|rate|cost)\s*[:\-·.…]*\s*\$?([\d,]+\.\d{2})/i,
+    /\bfamily\b[^$\n]{0,20}\$\s*([\d,]+\.\d{2})/i,
   ]));
 
   // Effective date
