@@ -1565,8 +1565,8 @@
     if(!state.caseId){showToast('No case loaded','warning');return;}
     showLoading(true,'Building Excel workbook…');
     try {
-      var r=await apiPostBlob('/export/xlsx',{caseId:state.caseId,clientName:document.getElementById('clientName').value||'Client',effectiveDate:document.getElementById('effectiveDate').value||'',contribution:state.contribution,currentPremiums:state.currentPremiums});
-      triggerDownload(r.blob,r.filename||'BenefitsAnalysis.xlsx');showLoading(false);showToast('✓ Excel downloaded','success');
+      var r=await apiPostBlob('/export/xlsx',{caseId:state.caseId,clientName:document.getElementById('clientName').value||'Client',effectiveDate:document.getElementById('effectiveDate').value||'',contribution:state.contribution,currentPremiums:state.currentPremiums,selectedPlanIndices:state.selectedPlanIndices.length>0?state.selectedPlanIndices:undefined});
+      triggerDownload(r.blob,r.filename||'BenefitsAnalysis.xlsx');showLoading(false);showToast('✓ Excel downloaded with '+(state.selectedPlanIndices.length>0?state.selectedPlanIndices.length+' selected':' recommended')+' plans','success');
     } catch(err){showLoading(false);showToast('XLSX failed: '+err.message,'error');}
   };
 

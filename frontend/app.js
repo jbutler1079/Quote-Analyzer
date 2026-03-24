@@ -865,13 +865,15 @@ async function downloadXLSX() {
   if (!state.caseId) { showToast('No case loaded', 'warning'); return; }
   showLoading(true, 'Building Excel workbook…');
   try {
-    const { blob, filename } = await apiPostBlob('/export/xlsx', {
+    const body = {
       caseId: state.caseId,
       clientName: document.getElementById('clientName').value || 'Client',
       effectiveDate: document.getElementById('effectiveDate').value || '',
       contribution: state.contribution,
       currentPremiums: state.currentPremiums,
-    });
+    };
+    if (state.selectedPlanIndices && state.selectedPlanIndices.length > 0) body.selectedPlanIndices = state.selectedPlanIndices;
+    const { blob, filename } = await apiPostBlob('/export/xlsx', body);
     triggerDownload(blob, filename || 'BenefitsAnalysis.xlsx');
     showLoading(false);
     showToast('✓ Excel file downloaded successfully', 'success');

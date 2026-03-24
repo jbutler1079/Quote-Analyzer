@@ -4215,7 +4215,7 @@ app.post('/recommend', (req, res) => {
 // ── Export PPTX ───────────────────────────────────────────────────────────────
 app.post('/export/pptx', async (req, res) => {
   try {
-    const { caseId, clientName = 'Client', effectiveDate = '', contribution, selectedPlanIndices } = req.body;
+    const { caseId, clientName = 'Client', effectiveDate = '', contribution, selectedPlanIndices, currentPremiums } = req.body;
     if (!caseId) return res.status(400).json({ error: 'caseId is required' });
     const caseData = caseStore.get(caseId);
     if (!caseData) return res.status(404).json({ error: 'Case not found' });
@@ -4420,21 +4420,54 @@ app.post('/export/pptx', async (req, res) => {
       // ── Right column: Composite Monthly Rates ──
       const rightX = 5.2;
       const rightW = 4.3;
-      s.addText('COMPOSITE MONTHLY RATES', { x: rightX, y: 1.72, w: rightW, h: 0.3, fontSize: 9, bold: true, color: ACCENT, letterSpacing: 1.5 });
+      const cpData = currentPremiums || caseData.currentPremiums || {};
+      const hasCPData = cpData.ee != null || cpData.es != null || cpData.ec != null || cpData.ef != null;
+      s.addText(hasCPData ? 'QUOTED vs. CURRENT RATES' : 'COMPOSITE MONTHLY RATES', { x: rightX, y: 1.72, w: rightW, h: 0.3, fontSize: 9, bold: true, color: ACCENT, letterSpacing: 1.5 });
 
-      const rates = [
-        ['EE Only', fmtDol(plan.premiumEE)],
-        ['EE + Spouse', fmtDol(plan.premiumES)],
-        ['EE + Child(ren)', fmtDol(plan.premiumEC)],
-        ['Family', fmtDol(plan.premiumEF)],
+      const ratesTiers = [
+        { label: 'EE Only', field: 'premiumEE', cpKey: 'ee' },
+        { label: 'EE + Spouse', field: 'premiumES', cpKey: 'es' },
+        { label: 'EE + Child(ren)', field: 'premiumEC', cpKey: 'ec' },
+        { label: 'Family', field: 'premiumEF', cpKey: 'ef' },
       ];
-      rates.forEach(([lbl, val], i) => {
-        const yPos = 2.02 + i * 0.4;
-        const bg = i % 2 === 0 ? LIGHT : WHITE;
-        s.addShape(pptx.ShapeType.rect, { x: rightX, y: yPos, w: rightW, h: 0.38, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
-        s.addText(lbl, { x: rightX + 0.1, y: yPos + 0.05, w: 2.0, h: 0.28, fontSize: 10, bold: true, color: TEXT_DARK });
-        s.addText(val, { x: rightX + 2.1, y: yPos + 0.05, w: 2.0, h: 0.28, fontSize: 10, color: ACCENT, bold: true, align: 'right' });
-      });
+      if (hasCPData) {
+        // Header sub-row
+        s.addShape(pptx.ShapeType.rect, { x: rightX, y: 2.0, w: rightW, h: 0.26, fill: { color: PRIMARY } });
+        s.addText('Tier', { x: rightX + 0.08, y: 2.02, w: 1.3, h: 0.22, fontSize: 8, bold: true, color: WHITE });
+        s.addText('Current', { x: rightX + 1.3, y: 2.02, w: 1.0, h: 0.22, fontSize: 8, bold: true, color: WHITE, align: 'center' });
+        s.addText('Quoted', { x: rightX + 2.3, y: 2.02, w: 1.0, h: 0.22, fontSize: 8, bold: true, color: WHITE, align: 'center' });
+        s.addText('Change', { x: rightX + 3.3, y: 2.02, w: 1.0, h: 0.22, fontSize: 8, bold: true, color: WHITE, align: 'center' });
+
+        ratesTiers.forEach((t, i) => {
+          const yPos = 2.28 + i * 0.4;
+          const bg = i % 2 === 0 ? LIGHT : WHITE;
+          s.addShape(pptx.ShapeType.rect, { x: rightX, y: yPos, w: rightW, h: 0.38, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+          s.addText(t.label, { x: rightX + 0.08, y: yPos + 0.07, w: 1.2, h: 0.24, fontSize: 9, bold: true, color: TEXT_DARK });
+          s.addText(cpData[t.cpKey] != null ? fmtDol(cpData[t.cpKey]) : '\u2014', { x: rightX + 1.3, y: yPos + 0.07, w: 1.0, h: 0.24, fontSize: 9, color: ORANGE, bold: true, align: 'center' });
+          s.addText(plan[t.field] != null ? fmtDol(plan[t.field]) : '\u2014', { x: rightX + 2.3, y: yPos + 0.07, w: 1.0, h: 0.24, fontSize: 9, color: ACCENT, bold: true, align: 'center' });
+          if (cpData[t.cpKey] != null && plan[t.field] != null) {
+            const diff = plan[t.field] - cpData[t.cpKey];
+            const pct = cpData[t.cpKey] > 0 ? ((diff / cpData[t.cpKey]) * 100) : 0;
+            const sign = diff > 0 ? '+' : '';
+            const dColor = diff > 0 ? 'e74c3c' : diff < 0 ? GREEN : MUTED;
+            s.addText(`${sign}${pct.toFixed(1)}%`, { x: rightX + 3.3, y: yPos + 0.07, w: 1.0, h: 0.24, fontSize: 9, bold: true, color: dColor, align: 'center' });
+          }
+        });
+      } else {
+        const rates = [
+          ['EE Only', fmtDol(plan.premiumEE)],
+          ['EE + Spouse', fmtDol(plan.premiumES)],
+          ['EE + Child(ren)', fmtDol(plan.premiumEC)],
+          ['Family', fmtDol(plan.premiumEF)],
+        ];
+        rates.forEach(([lbl, val], i) => {
+          const yPos = 2.02 + i * 0.4;
+          const bg = i % 2 === 0 ? LIGHT : WHITE;
+          s.addShape(pptx.ShapeType.rect, { x: rightX, y: yPos, w: rightW, h: 0.38, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+          s.addText(lbl, { x: rightX + 0.1, y: yPos + 0.05, w: 2.0, h: 0.28, fontSize: 10, bold: true, color: TEXT_DARK });
+          s.addText(val, { x: rightX + 2.1, y: yPos + 0.05, w: 2.0, h: 0.28, fontSize: 10, color: ACCENT, bold: true, align: 'right' });
+        });
+      }
 
       // ── Per Employee Per Pay Period Section ──
       const shares = calculatePlanCostShares(plan, census, contributionConfig);
@@ -4686,6 +4719,105 @@ app.post('/export/pptx', async (req, res) => {
     });
     addFooter(s8);
 
+    // ── Current vs. Quoted Rates Comparison Slide ──
+    const cp = currentPremiums || caseData.currentPremiums || {};
+    const hasCurrentPremiums = cp.ee != null || cp.es != null || cp.ec != null || cp.ef != null;
+    if (hasCurrentPremiums) {
+      const sComp = pptx.addSlide();
+      addSlideHeader(sComp, 'Current vs. Quoted Rates', 'Monthly premium comparison with current plan');
+
+      const compTiers = [
+        { key: 'ee', label: 'EE Only', field: 'premiumEE' },
+        { key: 'es', label: 'EE + Spouse', field: 'premiumES' },
+        { key: 'ec', label: 'EE + Child(ren)', field: 'premiumEC' },
+        { key: 'ef', label: 'Family', field: 'premiumEF' },
+      ];
+
+      // Dynamic column sizing
+      const crStartX = 0.3;
+      const crTotalW = 9.4;
+      const crLabelW = numPlans <= 3 ? 1.6 : (numPlans <= 4 ? 1.4 : 1.2);
+      const crCurrentW = numPlans <= 3 ? 1.3 : (numPlans <= 4 ? 1.1 : 1.0);
+      const crPlanColW = (crTotalW - crLabelW - crCurrentW) / numPlans;
+      const crFontSize = numPlans <= 3 ? 9 : (numPlans <= 4 ? 8 : 7);
+
+      // Header row
+      const crHdrY = 1.2;
+      sComp.addShape(pptx.ShapeType.rect, { x: crStartX, y: crHdrY, w: crLabelW, h: 0.42, fill: { color: PRIMARY } });
+      sComp.addText('Tier', { x: crStartX + 0.05, y: crHdrY + 0.06, w: crLabelW - 0.1, h: 0.3, fontSize: crFontSize, bold: true, color: WHITE });
+      sComp.addShape(pptx.ShapeType.rect, { x: crStartX + crLabelW, y: crHdrY, w: crCurrentW, h: 0.42, fill: { color: ORANGE } });
+      sComp.addText('Current', { x: crStartX + crLabelW + 0.05, y: crHdrY + 0.06, w: crCurrentW - 0.1, h: 0.3, fontSize: crFontSize, bold: true, color: WHITE, align: 'center' });
+      compPlans.forEach((plan, ci) => {
+        const cx = crStartX + crLabelW + crCurrentW + ci * crPlanColW;
+        const colLabel = (plan.recommendationLabel || rankLabels[ci] || `Plan ${ci + 1}`).substring(0, numPlans <= 3 ? 16 : 12);
+        sComp.addShape(pptx.ShapeType.rect, { x: cx, y: crHdrY, w: crPlanColW, h: 0.42, fill: { color: ACCENT } });
+        sComp.addText(colLabel, { x: cx + 0.03, y: crHdrY + 0.06, w: crPlanColW - 0.06, h: 0.3, fontSize: crFontSize - 1, bold: true, color: WHITE, align: 'center' });
+      });
+
+      // Rate rows (monthly premium per tier)
+      compTiers.forEach((tier, ri) => {
+        const yPos = crHdrY + 0.45 + ri * 0.7;
+        const bg = ri % 2 === 0 ? LIGHT : WHITE;
+
+        // Tier label
+        sComp.addShape(pptx.ShapeType.rect, { x: crStartX, y: yPos, w: crLabelW, h: 0.68, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+        sComp.addText(tier.label, { x: crStartX + 0.05, y: yPos + 0.18, w: crLabelW - 0.1, h: 0.3, fontSize: crFontSize, bold: true, color: TEXT_DARK });
+
+        // Current rate
+        const currentVal = cp[tier.key];
+        sComp.addShape(pptx.ShapeType.rect, { x: crStartX + crLabelW, y: yPos, w: crCurrentW, h: 0.68, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+        sComp.addText(currentVal != null ? fmtDol(currentVal) : '\u2014', { x: crStartX + crLabelW + 0.03, y: yPos + 0.08, w: crCurrentW - 0.06, h: 0.24, fontSize: crFontSize, bold: true, color: ORANGE, align: 'center' });
+
+        // Plan columns: quoted rate + delta
+        compPlans.forEach((plan, ci) => {
+          const cx = crStartX + crLabelW + crCurrentW + ci * crPlanColW;
+          const quotedVal = plan[tier.field];
+          sComp.addShape(pptx.ShapeType.rect, { x: cx, y: yPos, w: crPlanColW, h: 0.68, fill: { color: bg }, line: { color: 'e8e8e8', width: 0.3 } });
+          sComp.addText(quotedVal != null ? fmtDol(quotedVal) : '\u2014', { x: cx + 0.03, y: yPos + 0.05, w: crPlanColW - 0.06, h: 0.24, fontSize: crFontSize, bold: true, color: ACCENT, align: 'center' });
+
+          // Delta line
+          if (currentVal != null && quotedVal != null) {
+            const diff = quotedVal - currentVal;
+            const pct = currentVal > 0 ? ((diff / currentVal) * 100) : 0;
+            const sign = diff > 0 ? '+' : '';
+            const deltaColor = diff > 0 ? 'e74c3c' : diff < 0 ? GREEN : MUTED;
+            sComp.addText(`${sign}${fmtDol(diff)} (${sign}${pct.toFixed(1)}%)`, { x: cx + 0.03, y: yPos + 0.35, w: crPlanColW - 0.06, h: 0.28, fontSize: crFontSize - 1, color: deltaColor, align: 'center' });
+          }
+        });
+      });
+
+      // Total aggregate comparison
+      const aggCompY = crHdrY + 0.45 + 4 * 0.7 + 0.15;
+      const totalEnrolled = (census.ee || 0) + (census.es || 0) + (census.ec || 0) + (census.ef || 0);
+      if (totalEnrolled > 0) {
+        sComp.addText('ESTIMATED MONTHLY AGGREGATE (ALL ENROLLED)', { x: crStartX, y: aggCompY, w: crTotalW, h: 0.28, fontSize: crFontSize - 1, bold: true, color: ACCENT, letterSpacing: 1 });
+
+        const aggRowY = aggCompY + 0.3;
+        // Current aggregate
+        let currentAgg = 0;
+        compTiers.forEach(t => { currentAgg += (cp[t.key] || 0) * (census[t.key] || 0); });
+        sComp.addShape(pptx.ShapeType.rect, { x: crStartX, y: aggRowY, w: crLabelW, h: 0.5, fill: { color: 'fef5e7' }, line: { color: ORANGE, width: 1 }, rectRadius: 0.05 });
+        sComp.addText('Current', { x: crStartX + 0.05, y: aggRowY + 0.06, w: crLabelW - 0.1, h: 0.14, fontSize: crFontSize - 1, bold: true, color: MUTED });
+        sComp.addText(fmtDol(currentAgg), { x: crStartX + 0.05, y: aggRowY + 0.22, w: crLabelW - 0.1, h: 0.24, fontSize: 12, bold: true, color: ORANGE });
+
+        sComp.addShape(pptx.ShapeType.rect, { x: crStartX + crLabelW, y: aggRowY, w: crCurrentW, h: 0.5, fill: { color: 'fef5e7' } });
+
+        compPlans.forEach((plan, ci) => {
+          let planAgg = 0;
+          compTiers.forEach(t => { planAgg += (plan[t.field] || 0) * (census[t.key] || 0); });
+          const cx = crStartX + crLabelW + crCurrentW + ci * crPlanColW;
+          const diff = planAgg - currentAgg;
+          const sign = diff > 0 ? '+' : '';
+          const deltaColor = diff > 0 ? 'e74c3c' : diff < 0 ? GREEN : MUTED;
+          sComp.addShape(pptx.ShapeType.rect, { x: cx, y: aggRowY, w: crPlanColW, h: 0.5, fill: { color: 'e8f4fd' }, line: { color: ACCENT, width: 1 }, rectRadius: 0.05 });
+          sComp.addText(fmtDol(planAgg), { x: cx + 0.03, y: aggRowY + 0.03, w: crPlanColW - 0.06, h: 0.2, fontSize: 11, bold: true, color: PRIMARY, align: 'center' });
+          sComp.addText(`${sign}${fmtDol(diff)}/mo`, { x: cx + 0.03, y: aggRowY + 0.26, w: crPlanColW - 0.06, h: 0.2, fontSize: crFontSize, bold: true, color: deltaColor, align: 'center' });
+        });
+      }
+
+      addFooter(sComp);
+    }
+
     // ── Slide 9: Appendix — All Plans ──
     const s9 = pptx.addSlide();
     addSlideHeader(s9, 'Appendix', 'All plans analyzed, ranked by overall score');
@@ -4741,7 +4873,7 @@ app.post('/export/pptx', async (req, res) => {
 // ── Export XLSX ───────────────────────────────────────────────────────────────
 app.post('/export/xlsx', async (req, res) => {
   try {
-    const { caseId, clientName = 'Client', effectiveDate = '', contribution } = req.body;
+    const { caseId, clientName = 'Client', effectiveDate = '', contribution, selectedPlanIndices, currentPremiums } = req.body;
     if (!caseId) return res.status(400).json({ error: 'caseId is required' });
     const caseData = caseStore.get(caseId);
     if (!caseData) return res.status(404).json({ error: 'Case not found' });
@@ -4750,19 +4882,45 @@ app.post('/export/xlsx', async (req, res) => {
     const recData = caseData.recommendations || {};
     const contributionConfig = normalizeContributionConfig(contribution || recData.contribution || caseData.contribution || defaultContributionConfig());
     caseData.contribution = contributionConfig;
-    const recommendations = (recData.recommendations || plans.slice(0, 3).map((p, i) => ({ rank: i + 1, ...p }))).map(plan => {
-      if (typeof plan.employerPerPayCost === 'number' && typeof plan.employeePerPayCost === 'number') return plan;
-      const shares = calculatePlanCostShares(plan, caseData.census || {}, contributionConfig);
-      return {
-        ...plan,
-        employerMonthlyCost: Math.round(shares.employerMonthlyTotal * 100) / 100,
-        employeeMonthlyCost: Math.round(shares.employeeMonthlyTotal * 100) / 100,
-        employerPerPayCost: Math.round(shares.employerPerPayTotal * 100) / 100,
-        employeePerPayCost: Math.round(shares.employeePerPayTotal * 100) / 100,
-        payrollFrequency: shares.payrollFrequency,
-        contributionBreakdown: shares.byTier,
-      };
-    });
+
+    // If specific plans were selected, use those; otherwise fall back to recommendations
+    const useManualSelection = Array.isArray(selectedPlanIndices) && selectedPlanIndices.length > 0;
+    let recommendations;
+    if (useManualSelection) {
+      recommendations = selectedPlanIndices
+        .filter(i => i >= 0 && i < plans.length)
+        .slice(0, 5)
+        .map((idx, rank) => {
+          const plan = plans[idx];
+          const shares = calculatePlanCostShares(plan, caseData.census || {}, contributionConfig);
+          return {
+            ...plan,
+            rank: rank + 1,
+            recommendationLabel: `Selected Plan ${rank + 1}`,
+            employerMonthlyCost: Math.round(shares.employerMonthlyTotal * 100) / 100,
+            employeeMonthlyCost: Math.round(shares.employeeMonthlyTotal * 100) / 100,
+            employerPerPayCost: Math.round(shares.employerPerPayTotal * 100) / 100,
+            employeePerPayCost: Math.round(shares.employeePerPayTotal * 100) / 100,
+            monthlyTotalCost: Math.round((shares.employerMonthlyTotal + shares.employeeMonthlyTotal) * 100) / 100,
+            payrollFrequency: shares.payrollFrequency,
+            contributionBreakdown: shares.byTier,
+          };
+        });
+    } else {
+      recommendations = (recData.recommendations || plans.slice(0, 3).map((p, i) => ({ rank: i + 1, ...p }))).map(plan => {
+        if (typeof plan.employerPerPayCost === 'number' && typeof plan.employeePerPayCost === 'number') return plan;
+        const shares = calculatePlanCostShares(plan, caseData.census || {}, contributionConfig);
+        return {
+          ...plan,
+          employerMonthlyCost: Math.round(shares.employerMonthlyTotal * 100) / 100,
+          employeeMonthlyCost: Math.round(shares.employeeMonthlyTotal * 100) / 100,
+          employerPerPayCost: Math.round(shares.employerPerPayTotal * 100) / 100,
+          employeePerPayCost: Math.round(shares.employeePerPayTotal * 100) / 100,
+          payrollFrequency: shares.payrollFrequency,
+          contributionBreakdown: shares.byTier,
+        };
+      });
+    }
     const census = caseData.census || {};
 
     const workbook = new ExcelJS.Workbook();
@@ -5000,6 +5158,145 @@ app.post('/export/xlsx', async (req, res) => {
 
     // Column widths for summary
     summSheet.columns = planHdrCols.map((h, i) => ({ width: [8, 20, 28, 12, 10, 10, 18, 16, 16, 16, 16, 16, 16, 12, 12, 12, 14, 14, 14, 14][i] || 14 }));
+
+    // ── Sheet 3: Current vs. Quoted ──
+    const cpXlsx = currentPremiums || caseData.currentPremiums || {};
+    const hasCPXlsx = cpXlsx.ee != null || cpXlsx.es != null || cpXlsx.ec != null || cpXlsx.ef != null;
+    if (hasCPXlsx) {
+      const compSheet = workbook.addWorksheet('Current vs Quoted');
+      const greenFont = { bold: true, color: { argb: 'FF27ae60' } };
+      const redFont = { bold: true, color: { argb: 'FFe74c3c' } };
+      const orangeFont = { bold: true, color: { argb: 'FFe67e22' } };
+      const accentFont = { bold: true, color: { argb: 'FF2e86de' } };
+      const fmtDolXl = v => v != null ? `$${Number(v).toFixed(2)}` : '\u2014';
+
+      // Title
+      compSheet.mergeCells(1, 1, 1, 2 + recommendations.length * 2);
+      const compTitle = compSheet.getCell('A1');
+      compTitle.value = `Current vs. Quoted Premium Comparison \u2014 ${clientName}`;
+      compTitle.font = { bold: true, size: 14, color: { argb: 'FFFFFFFF' } };
+      compTitle.fill = headerFill;
+      compTitle.alignment = { horizontal: 'center', vertical: 'middle' };
+      compSheet.getRow(1).height = 30;
+
+      // Build header row: Tier | Current | Plan1 Quoted | Plan1 Change | Plan2 Quoted | ...
+      const compHdrRow = 3;
+      const compHeaders = ['Tier', 'Current Rate'];
+      recommendations.forEach((p, i) => {
+        const label = (p.recommendationLabel || p.planName || `Plan ${i+1}`).substring(0, 25);
+        compHeaders.push(`${label} Rate`);
+        compHeaders.push(`${label} Change`);
+      });
+      compHeaders.forEach((hdr, ci) => {
+        const cell = compSheet.getCell(compHdrRow, ci + 1);
+        cell.value = hdr;
+        cell.font = headerFont;
+        cell.fill = ci === 1 ? { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFe67e22' } } : headerFill;
+        cell.border = thinBorder;
+        cell.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+      });
+      compSheet.getRow(compHdrRow).height = 28;
+
+      // Data rows per tier
+      const tierDefs = [
+        { key: 'ee', label: 'EE Only', field: 'premiumEE' },
+        { key: 'es', label: 'EE + Spouse', field: 'premiumES' },
+        { key: 'ec', label: 'EE + Child(ren)', field: 'premiumEC' },
+        { key: 'ef', label: 'Family', field: 'premiumEF' },
+      ];
+      tierDefs.forEach((t, ri) => {
+        const rowNum = compHdrRow + 1 + ri;
+        const row = compSheet.getRow(rowNum);
+        const bgFill = ri % 2 === 0 ? whiteFill : altFill;
+
+        // Tier label
+        const tierCell = compSheet.getCell(rowNum, 1);
+        tierCell.value = t.label;
+        tierCell.font = { bold: true };
+        tierCell.fill = bgFill;
+        tierCell.border = thinBorder;
+
+        // Current rate
+        const curCell = compSheet.getCell(rowNum, 2);
+        curCell.value = cpXlsx[t.key] != null ? fmtDolXl(cpXlsx[t.key]) : '\u2014';
+        curCell.font = orangeFont;
+        curCell.fill = bgFill;
+        curCell.border = thinBorder;
+        curCell.alignment = { horizontal: 'center' };
+
+        // Plan rates + deltas
+        recommendations.forEach((plan, pi) => {
+          const quotedCell = compSheet.getCell(rowNum, 3 + pi * 2);
+          quotedCell.value = plan[t.field] != null ? fmtDolXl(plan[t.field]) : '\u2014';
+          quotedCell.font = accentFont;
+          quotedCell.fill = bgFill;
+          quotedCell.border = thinBorder;
+          quotedCell.alignment = { horizontal: 'center' };
+
+          const deltaCell = compSheet.getCell(rowNum, 4 + pi * 2);
+          if (cpXlsx[t.key] != null && plan[t.field] != null) {
+            const diff = plan[t.field] - cpXlsx[t.key];
+            const pct = cpXlsx[t.key] > 0 ? ((diff / cpXlsx[t.key]) * 100) : 0;
+            const sign = diff > 0 ? '+' : '';
+            deltaCell.value = `${sign}${fmtDolXl(diff)} (${sign}${pct.toFixed(1)}%)`;
+            deltaCell.font = diff > 0 ? redFont : diff < 0 ? greenFont : { bold: true };
+          } else {
+            deltaCell.value = '\u2014';
+          }
+          deltaCell.fill = bgFill;
+          deltaCell.border = thinBorder;
+          deltaCell.alignment = { horizontal: 'center' };
+        });
+        row.height = 22;
+      });
+
+      // Aggregate monthly total row
+      const aggRow = compHdrRow + 1 + tierDefs.length + 1;
+      const aggLabelCell = compSheet.getCell(aggRow, 1);
+      aggLabelCell.value = 'Est. Monthly Aggregate';
+      aggLabelCell.font = { bold: true, size: 11 };
+      aggLabelCell.fill = headerFill;
+      aggLabelCell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      aggLabelCell.border = thinBorder;
+
+      let currentAgg = 0;
+      const xlCensus = caseData.census || {};
+      tierDefs.forEach(t => { currentAgg += (cpXlsx[t.key] || 0) * (xlCensus[t.key] || 0); });
+      const curAggCell = compSheet.getCell(aggRow, 2);
+      curAggCell.value = fmtDolXl(currentAgg);
+      curAggCell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+      curAggCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFe67e22' } };
+      curAggCell.border = thinBorder;
+      curAggCell.alignment = { horizontal: 'center' };
+
+      recommendations.forEach((plan, pi) => {
+        let planAgg = 0;
+        tierDefs.forEach(t => { planAgg += (plan[t.field] || 0) * (xlCensus[t.key] || 0); });
+        const diff = planAgg - currentAgg;
+        const sign = diff > 0 ? '+' : '';
+
+        const aggValCell = compSheet.getCell(aggRow, 3 + pi * 2);
+        aggValCell.value = fmtDolXl(planAgg);
+        aggValCell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        aggValCell.fill = headerFill;
+        aggValCell.border = thinBorder;
+        aggValCell.alignment = { horizontal: 'center' };
+
+        const aggDeltaCell = compSheet.getCell(aggRow, 4 + pi * 2);
+        aggDeltaCell.value = `${sign}${fmtDolXl(diff)}/mo`;
+        aggDeltaCell.font = diff > 0 ? redFont : diff < 0 ? greenFont : { bold: true };
+        aggDeltaCell.fill = headerFill;
+        aggDeltaCell.font = diff > 0 ? { bold: true, color: { argb: 'FFe74c3c' } } : diff < 0 ? { bold: true, color: { argb: 'FF27ae60' } } : { bold: true, color: { argb: 'FFFFFFFF' } };
+        aggDeltaCell.border = thinBorder;
+        aggDeltaCell.alignment = { horizontal: 'center' };
+      });
+      compSheet.getRow(aggRow).height = 26;
+
+      // Set column widths
+      const compColWidths = [18, 16];
+      recommendations.forEach(() => { compColWidths.push(20, 22); });
+      compSheet.columns = compColWidths.map(w => ({ width: w }));
+    }
 
     const xlsxBuffer = await workbook.xlsx.writeBuffer();
     const safeName = (clientName || 'Client').replace(/[^a-z0-9]/gi, '_');
