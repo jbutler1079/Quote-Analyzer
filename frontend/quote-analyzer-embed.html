@@ -1062,11 +1062,13 @@
     var fromGlobal = (window.QUOTE_ANALYZER_API_BASE || (window.qaConfig && window.qaConfig.apiBase) || '');
     var fromQuery = (new URLSearchParams(window.location.search).get('apiBase') || '');
     var base = String(fromGlobal || fromQuery || '').trim().replace(/\/+$/, '');
+    if (base) return base;
     // When served from the backend itself (e.g. localhost:3001), use current origin
-    if (!base && window.location.protocol !== 'file:') {
-      base = window.location.origin;
+    if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+      return window.location.origin;
     }
-    return base;
+    // Default: deployed backend on Render
+    return 'https://quote-analyzer-api.onrender.com';
   }
 
   /* ── API helpers ──────────────────────────────────────────────────────── */
