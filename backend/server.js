@@ -160,7 +160,7 @@ const upload = multer({
 // ── Auth middleware (disabled – internal tool) ───────────────────────────────
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'llm-strategy13-v1', strategies: 13, llmEnabled: !!process.env.OPENAI_API_KEY }));
+app.get('/health', (_req, res) => res.json({ status: 'ok', version: 'llm-strategy14-v1', strategies: 14, llmEnabled: !!process.env.OPENAI_API_KEY }));
 
 // ── Debug: last extraction info ───────────────────────────────────────────────
 app.get('/debug/lastextract', (_req, res) => {
@@ -637,6 +637,16 @@ async function extractPlanFromText(text, sourceFile) {
       candidates.push({ name: 'BCBS proposal grid', plans: bcbsPlans, score });
     }
   } catch (e) { console.log(`[EXTRACT] Strategy 9 error: ${e.message}`); }
+
+  // ── Strategy 14: BCBS Proposal Card Format ──────────────────────────────
+  try {
+    const bcbsCardPlans = extractFromBCBSProposalCard(text, sourceFile);
+    if (bcbsCardPlans.length > 0) {
+      const score = scoreStrategyResult(bcbsCardPlans) + 0.1;
+      console.log(`[EXTRACT] Strategy 14 (BCBS card): ${bcbsCardPlans.length} plans, score=${score}`);
+      candidates.push({ name: 'BCBS proposal card', plans: bcbsCardPlans, score });
+    }
+  } catch (e) { console.log(`[EXTRACT] Strategy 14 error: ${e.message}`); }
 
   // ── Strategy 10: BSW Vertical Format ─────────────────────────────────────
   try {
@@ -2717,6 +2727,152 @@ function extractFromBCBSGrid(text, sourceFile) {
   return plans;
 }
 
+// ── Strategy 14: BCBS Proposal Card Format ────────────────────────────────────
+// Handles the BCBS TX "proposal card" layout where each plan appears as a labeled
+// card block with fields like:
+//   BlueCross BlueShield of Texas G9L1CHC Blue Choice
+//   PPO Network Gold
+//   Deductible
+//   (In) Ind / Fam$2,250 / $6,750
+//   Monthly Composite Rates
+//   Employee Only (20)$821.46
+function extractFromBCBSProposalCard(text, sourceFile) {
+  // Gate: must look like a BCBS proposal card format
+  if (!/BlueCross\s*BlueShield/i.test(text)) return [];
+  if (!/Monthly\s*Composite\s*Rates/i.test(text)) return [];
+  if (!/\(In\)\s*Ind\s*\/\s*Fam/i.test(text)) return [];
+
+  const plans = [];
+  const carrier = 'BCBS';
+
+  // Extract effective date
+  const effMatch = text.match(/Effective\s*Date\s*[:\-]?\s*(\w+\s+\d{1,2},?\s*\d{4})/i);
+  const effectiveDate = effMatch ? effMatch[1].trim() : null;
+
+  // Split into plan card blocks.
+  // Each card starts with a metal level line (Gold, Silver, Bronze, Platinum)
+  // followed by a plan number, then "BlueCross BlueShield of Texas PLANCODE..."
+  // We split on the pattern: metal level + number + BlueCross header
+  const cardPattern = /(?:^|\n)\s*(Platinum|Gold|Silver|Bronze|Expanded\s*Bronze)\s*\n\s*(\d+)\s*\n\s*(BlueCross\s*BlueShield\s*of\s*Texas\s+\S+.*?)(?=\n\s*(?:Platinum|Gold|Silver|Bronze|Expanded\s*Bronze)\s*\n\s*\d+\s*\n\s*BlueCross|Medical\s*Coverage\s*\n|Medical\s*Employer\s*Contribution|\n\s*-\s*\d+\s*Available\s*Plans|$)/gis;
+
+  let match;
+  while ((match = cardPattern.exec(text)) !== null) {
+    const metalLevel = match[1].trim().replace(/^Expanded\s*/i, '');
+    const cardText = match[3];
+
+    // Extract plan code from the first line: "BlueCross BlueShield of Texas G9L1CHC Blue Choice"
+    const codeMatch = cardText.match(/BlueCross\s*BlueShield\s*of\s*Texas\s+(\S+)\s+(.*?)(?:\n|$)/i);
+    if (!codeMatch) continue;
+    const planCode = codeMatch[1].trim();
+
+    // Extract network type from continuation: "PPO Network Gold" or "HMO Network Silver"
+    const networkMatch = cardText.match(/(PPO|HMO)\s*Network/i);
+    const networkType = networkMatch ? networkMatch[1].toUpperCase() : null;
+
+    // Build plan name
+    const networkLabel = networkType === 'HMO' ? 'Blue Advantage HMO' : 'Blue Choice PPO';
+    const planName = `${networkLabel} ${metalLevel} ${planCode}`.trim();
+
+    // Deductible (In) Ind / Fam$2,250 / $6,750
+    const dedInMatch = cardText.match(/\(In\)\s*Ind\s*\/\s*Fam\s*\$?([\d,]+(?:\.\d+)?)\s*\/\s*\$?([\d,]+(?:\.\d+)?)/i);
+    const deductibleIndividual = dedInMatch ? parseMoney(dedInMatch[1]) : null;
+    const deductibleFamily = dedInMatch ? parseMoney(dedInMatch[2]) : null;
+
+    // OOP Max (In) Ind / Fam$6,750 / $18,400
+    const oopSection = cardText.match(/Out-of-Pocket\s*Max[\s\S]*?\(In\)\s*Ind\s*\/\s*Fam\s*\$?([\d,]+(?:\.\d+)?)\s*\/\s*\$?([\d,]+(?:\.\d+)?)/i);
+    const oopMaxIndividual = oopSection ? parseMoney(oopSection[1]) : null;
+    const oopMaxFamily = oopSection ? parseMoney(oopSection[2]) : null;
+
+    // Coinsurance: In-Network20%
+    const coinsMatch = cardText.match(/In-Network\s*(\d+)%/i);
+    const coinsurance = coinsMatch ? `${coinsMatch[1]}%` : null;
+
+    // Doctor Visit: $35 copayment
+    const pcpMatch = cardText.match(/Doctor\s*Visit\s*\n?\s*\$(\d+)\s*copay/i);
+    const copayPCP = pcpMatch ? parseInt(pcpMatch[1], 10) : null;
+
+    // Specialist Visit: $70 copayment
+    const specMatch = cardText.match(/Specialist\s*Visit\s*\n?\s*\$(\d+)\s*copay/i);
+    const copaySpecialist = specMatch ? parseInt(specMatch[1], 10) : null;
+
+    // Urgent Care: $75 copayment
+    const ucMatch = cardText.match(/Urgent\s*Care\s*\n?\s*\$(\d+)\s*copay/i);
+    const copayUrgentCare = ucMatch ? parseInt(ucMatch[1], 10) : null;
+
+    // Emergency Room: $500 copayment
+    const erMatch = cardText.match(/Emergency\s*Room\s*\n?\s*\$(\d+)\s*copay/i);
+    const copayER = erMatch ? parseInt(erMatch[1], 10) : null;
+
+    // Prescription Drugs: $10/$20/$70 $120/$150/$250
+    let rxTier1 = null, rxTier2 = null, rxTier3 = null;
+    const rxMatch = cardText.match(/Prescription\s*Drugs\s*\n?\s*\$(\d+)\/\$(\d+)\/\$(\d+)/i);
+    if (rxMatch) {
+      rxTier1 = parseInt(rxMatch[1], 10);
+      rxTier2 = parseInt(rxMatch[2], 10);
+      rxTier3 = parseInt(rxMatch[3], 10);
+    }
+
+    // Monthly Composite Rates:
+    // Employee Only (20)$821.46
+    // Employee & Spouse (0)$1,642.92
+    // Employee & Children (1)$1,642.92
+    // Employee & Family (3)$2,464.38
+    const eeMatch = cardText.match(/Employee\s*Only\s*\(\d+\)\s*\$?([\d,]+\.\d{2})/i);
+    const esMatch = cardText.match(/Employee\s*&\s*Spouse\s*\(\d+\)\s*\$?([\d,]+\.\d{2})/i);
+    const ecMatch = cardText.match(/Employee\s*&\s*Child(?:ren)?\s*\(\d+\)\s*\$?([\d,]+\.\d{2})/i);
+    const efMatch = cardText.match(/Employee\s*&\s*Family\s*\(\d+\)\s*\$?([\d,]+\.\d{2})/i);
+
+    const premiumEE = eeMatch ? parseMoney(eeMatch[1]) : null;
+    const premiumES = esMatch ? parseMoney(esMatch[1]) : null;
+    const premiumEC = ecMatch ? parseMoney(ecMatch[1]) : null;
+    const premiumEF = efMatch ? parseMoney(efMatch[1]) : null;
+
+    // HSA detection
+    const isHSA = /HSA/i.test(cardText);
+
+    // Confidence scoring
+    const fields = [deductibleIndividual, deductibleFamily, oopMaxIndividual, oopMaxFamily,
+                    coinsurance, copayPCP, copaySpecialist, copayER, copayUrgentCare,
+                    premiumEE, premiumES, premiumEC, premiumEF,
+                    rxTier1].filter(v => v != null);
+    const confidence = Math.min(1, 0.5 + (fields.length * 0.04));
+
+    plans.push({
+      id: uuidv4(),
+      carrier,
+      planName,
+      planCode,
+      networkType: isHSA ? 'HSA' : networkType,
+      metalLevel: metalLevel.charAt(0).toUpperCase() + metalLevel.slice(1).toLowerCase(),
+      deductibleIndividual,
+      deductibleFamily,
+      oopMaxIndividual,
+      oopMaxFamily,
+      coinsurance,
+      copayPCP,
+      copaySpecialist,
+      copayUrgentCare,
+      copayER,
+      rxDeductible: null,
+      rxTier1,
+      rxTier2,
+      rxTier3,
+      premiumEE,
+      premiumES,
+      premiumEC,
+      premiumEF,
+      effectiveDate,
+      ratingArea: null,
+      underwritingNotes: null,
+      extractionConfidence: confidence,
+      sourceFile,
+    });
+  }
+
+  console.log(`[BCBS CARD] Extracted ${plans.length} plans from BCBS proposal card format`);
+  return plans;
+}
+
 // ── Strategy 6: Repeated-keyword extraction ───────────────────────────────────
 // If the same benefit keyword (e.g., "deductible") appears multiple times in the
 // text, each time followed by a dollar amount, that likely means the PDF text was
@@ -3201,6 +3357,13 @@ function deduplicatePlans(plans) {
       // Match if: same name, OR one is a substring of the other (handles truncated names)
       const nameMatch = normA === normB ||
         (normA.length > 10 && normB.length > 10 && (normA.includes(normB) || normB.includes(normA)));
+      // Plan code match: if both have a planCode and they are the same, these are the same plan
+      // Also match if one plan's code appears in the other's name
+      const codeA = (plan.planCode || '').toUpperCase();
+      const codeB = (existing.planCode || '').toUpperCase();
+      const planCodeMatch = (codeA.length >= 4 && codeB.length >= 4 && codeA === codeB) ||
+        (codeA.length >= 4 && normB.toUpperCase().includes(codeA)) ||
+        (codeB.length >= 4 && normA.toUpperCase().includes(codeB));
       // Carrier must match if both are set
       const carrierMatch = !plan.carrier || !existing.carrier ||
         String(plan.carrier).toLowerCase() === String(existing.carrier).toLowerCase();
@@ -3212,7 +3375,7 @@ function deduplicatePlans(plans) {
       const sharedPremiums = premiumKeys.filter(k => plan[k] != null && existing[k] != null);
       const premiumFingerprint = sharedPremiums.length >= 2 &&
         sharedPremiums.every(k => Math.abs(plan[k] - existing[k]) < 0.01);
-      if ((nameMatch && carrierMatch && !premiumsDiffer) || (premiumFingerprint && carrierMatch)) {
+      if ((nameMatch && carrierMatch && !premiumsDiffer) || (premiumFingerprint && carrierMatch) || (planCodeMatch && carrierMatch)) {
         mergePlanInto(existing, plan);
         merged = true;
         break;
