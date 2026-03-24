@@ -31,7 +31,7 @@ const PAY_PERIODS_PER_MONTH = {
 /* ── Configuration ───────────────────────────────────────────────────────── */
 // Deployed backend URL. Override via window.QUOTE_ANALYZER_API_BASE if needed.
 // When served from the same server (port 3001), leave as '' to use same origin.
-const API_BASE = resolveApiBase() || 'https://quote-analyzer-api.onrender.com';
+const API_BASE = resolveApiBase() || '';
 
 function resolveApiBase() {
   const fromGlobal =
@@ -42,7 +42,12 @@ function resolveApiBase() {
     ? new URLSearchParams(window.location.search).get('apiBase')
     : '';
   const rawBase = String(fromGlobal || fromQuery || '').trim();
-  return rawBase.replace(/\/+$/, '');
+  if (rawBase) return rawBase.replace(/\/+$/, '');
+  // When served from the backend itself, use current origin
+  if (typeof window !== 'undefined' && window.location.protocol !== 'file:') {
+    return window.location.origin;
+  }
+  return '';
 }
 
 /* ── API helpers ──────────────────────────────────────────────────────────── */

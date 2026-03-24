@@ -1056,12 +1056,17 @@
 
   /* ── Configuration ───────────────────────────────────────────────────── */
   // Deployed backend URL. Override via window.QUOTE_ANALYZER_API_BASE if needed.
-  var API_BASE = resolveApiBase() || 'https://quote-analyzer-api.onrender.com';
+  var API_BASE = resolveApiBase() || '';
 
   function resolveApiBase() {
     var fromGlobal = (window.QUOTE_ANALYZER_API_BASE || (window.qaConfig && window.qaConfig.apiBase) || '');
     var fromQuery = (new URLSearchParams(window.location.search).get('apiBase') || '');
-    return String(fromGlobal || fromQuery || '').trim().replace(/\/+$/, '');
+    var base = String(fromGlobal || fromQuery || '').trim().replace(/\/+$/, '');
+    // When served from the backend itself (e.g. localhost:3001), use current origin
+    if (!base && window.location.protocol !== 'file:') {
+      base = window.location.origin;
+    }
+    return base;
   }
 
   /* ── API helpers ──────────────────────────────────────────────────────── */
@@ -1533,6 +1538,7 @@
           '<div class="rec-rate-item"><div class="rec-rate-label">EE + Child</div><div class="rec-rate-value">'+(plan.premiumEC!=null?fmtC(plan.premiumEC):'—')+'</div></div>'+
           '<div class="rec-rate-item"><div class="rec-rate-label">Family</div><div class="rec-rate-value">'+(plan.premiumEF!=null?fmtC(plan.premiumEF):'—')+'</div></div>'+
         '</div></div>'+
+        (function(){var cp=state.currentPremiums||{};var hasCP=cp.ee!=null||cp.es!=null||cp.ec!=null||cp.ef!=null;if(!hasCP)return '';var tiers=[{key:'ee',label:'EE Only',pk:'premiumEE'},{key:'es',label:'EE + Spouse',pk:'premiumES'},{key:'ec',label:'EE + Child',pk:'premiumEC'},{key:'ef',label:'Family',pk:'premiumEF'}];var items=tiers.filter(function(t){return cp[t.key]!=null&&plan[t.pk]!=null;}).map(function(t){var diff=plan[t.pk]-cp[t.key];var pct=cp[t.key]>0?((diff/cp[t.key])*100):0;var sign=diff>0?'+':'';var cls=diff>0?'delta-positive':diff<0?'delta-negative':'delta-zero';return '<div class="rec-rate-item"><div class="rec-rate-label">'+t.label+'</div>'+'<div class="rec-rate-value '+cls+'">'+sign+fmtC(diff)+' ('+sign+pct.toFixed(1)+'%)</div></div>';});if(items.length===0)return '';return '<div class="rec-rates" style="border-color:var(--warning);background:#fffbf0"><div class="rec-rates-title" style="color:var(--warning)">&Delta; vs Current Premiums</div><div class="rec-rates-grid">'+items.join('')+'</div></div>';})()+
         '<div class="rec-peremp"><div class="rec-peremp-title">Per Employee Per Pay Period ('+(FREQ_LABEL[cb.frequency]||'Bi-Weekly')+')</div><div class="rec-peremp-header"><span></span><span class="rec-peremp-hdr-label">Employer</span><span class="rec-peremp-hdr-label">Employee</span></div>'+perEmpRows+'</div>'+
         '<div class="rec-contribution"><div class="rec-contrib-title">Aggregate Totals Per Pay Period</div><div class="rec-contrib-summary"><div class="rec-contrib-pill"><div class="rec-contrib-pill-label">Employer Total</div><div class="rec-contrib-pill-value">'+fmtC(cb.employerPerPayTotal)+'</div></div><div class="rec-contrib-pill"><div class="rec-contrib-pill-label">Employee Total</div><div class="rec-contrib-pill-value">'+fmtC(cb.employeePerPayTotal)+'</div></div></div></div>'+
         '<div class="rec-why">'+escHtml(plan.whyRecommended||'')+'</div>';

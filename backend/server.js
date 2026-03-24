@@ -396,7 +396,7 @@ CRITICAL RULES:
       ],
       response_format: { type: 'json_object' },
       temperature: 0,
-      max_tokens: 16000,
+      max_tokens: 16384,
     });
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -681,8 +681,9 @@ async function extractPlanFromText(text, sourceFile) {
       const bestRegexPlans = candidates.length > 0
         ? Math.max(...candidates.map(c => c.plans.length))
         : 0;
-      // Only call LLM if: no plans found, or best regex score is weak (< 20 = few plans with few fields)
-      if (bestRegexPlans === 0 || bestRegexScore < 20) {
+      // Call LLM when regex strategies found few plans or mediocre quality.
+      // The LLM is especially valuable for carrier formats not covered by regex strategies.
+      if (bestRegexPlans <= 5 || bestRegexScore < 50) {
         console.log(`[LLM] Regex best: ${bestRegexPlans} plans, score=${bestRegexScore.toFixed(1)} — invoking LLM fallback`);
         llmStatus = 'invoked';
         const llmPlans = await extractWithLLM(text, sourceFile);
@@ -704,14 +705,32 @@ async function extractPlanFromText(text, sourceFile) {
     console.log(`[EXTRACT] Strategy 13 error: ${e.message}`);
   }
 
-  // ── Pick the best strategy by quality score ─────────────────────────────
+  // ── Merge plans from all strategies and deduplicate ─────────────────────
+  // Instead of picking a single "winner" strategy, merge results from ALL
+  // strategies so that plans found by any strategy are included.  Deduplication
+  // merges overlapping plans (same name/carrier) so the best data wins.
   let plans = [];
   if (candidates.length > 0) {
     candidates.sort((a, b) => b.score - a.score);
     const best = candidates[0];
-    console.log(`[EXTRACT] Winner: "${best.name}" with ${best.plans.length} plans, score=${best.score}`);
+    console.log(`[EXTRACT] Best strategy: "${best.name}" with ${best.plans.length} plans, score=${best.score}`);
     console.log(`[EXTRACT] All candidates:`, candidates.map(c => `${c.name}: ${c.plans.length} plans, score=${c.score}`));
-    plans = best.plans;
+
+    // Merge plans from all strategies (best-scored strategies first so their
+    // data takes priority during dedup merging)
+    const allStrategyPlans = [];
+    for (const candidate of candidates) {
+      allStrategyPlans.push(...candidate.plans);
+    }
+    plans = deduplicatePlans(allStrategyPlans);
+    console.log(`[EXTRACT] Merged ${allStrategyPlans.length} raw plans from ${candidates.length} strategies → ${plans.length} after dedup`);
+
+    // Quality filter: remove plans that lack premiums when other plans have them
+    const plansWithPremiums = plans.filter(p => p.premiumEE != null);
+    if (plansWithPremiums.length > 0 && plansWithPremiums.length < plans.length) {
+      plans = plansWithPremiums;
+      console.log(`[EXTRACT] Quality filter: kept ${plans.length} plans with premiums, removed ${allStrategyPlans.length - plans.length} without`);
+    }
 
     // Store debug info for last extraction
     lastExtractDebug = {
@@ -720,8 +739,10 @@ async function extractPlanFromText(text, sourceFile) {
       winner: best.name,
       winnerPlans: best.plans.length,
       winnerScore: best.score,
+      mergedTotal: allStrategyPlans.length,
+      afterDedup: plans.length,
       allCandidates: candidates.map(c => ({ name: c.name, plans: c.plans.length, score: c.score })),
-      planNames: best.plans.map(p => p.planName),
+      planNames: plans.map(p => p.planName),
       llmStatus,
     };
   }
@@ -2452,7 +2473,7 @@ function extractFromAetnaCostGrid(text, sourceFile) {
 //   $EO$ES$EC$EF$TOTAL                 ← premiums concatenated on one line
 function extractFromBCBSGrid(text, sourceFile) {
   // Gate: must look like a BCBS proposal grid
-  if (!/Illustrative\s*Composite|Blue\s*Choice\s*PPO|Blue\s*Advantage\s*HMO/i.test(text)) return [];
+  if (!/Illustrative\s*Composite|Blue\s*Choice[\s-]*PPO|Blue\s*Advantage[\s-]*HMO|Rates\s+and\s+Medical\s+Plan\s+Benefits|EOESECEF/i.test(text)) return [];
 
   const plans = [];
   const lines = text.split('\n');
@@ -2467,8 +2488,11 @@ function extractFromBCBSGrid(text, sourceFile) {
   const effMatch = text.match(/Effective\s*Date:\s*(\d{2}\/\d{2}\/\d{4})/i);
   const effectiveDate = effMatch ? effMatch[1] : null;
 
-  // BCBS plan IDs: letter + alphanumeric + 3-letter suffix (e.g. P9M1CHC, G654CHC, S663CHC, B662CHC, P9M1ADT)
-  const PLAN_ID_RE = /^([A-Z]\w{2,8}(?:CHC|ADT|ADV|HMO|PPO))$/;
+  // BCBS plan IDs: letter + alphanumeric codes
+  // Original format: P9M1CHC, G654CHC, S663CHC, B662CHC, P9M1ADT (letter + alnum + 3-letter suffix)
+  // TX BCBS format: MTBCP250, MTBCP002, MTBCP506 etc. (MTBCPxxx)
+  // Generic BCBS codes: 2-10 alphanumeric starting with a letter
+  const PLAN_ID_RE = /^([A-Z]{2,5}\w{2,8})$/;
   // Footnote line
   const FOOTNOTE_RE = /^(\*\d+)+$/;
   // Deductible/OOP line: "$X//" pattern
@@ -2486,8 +2510,9 @@ function extractFromBCBSGrid(text, sourceFile) {
     const line = lines[i].trim();
 
     // Track network context
-    if (/Blue\s*Choice\s*PPO/i.test(line)) { currentNetwork = 'PPO'; continue; }
-    if (/Blue\s*Advantage\s*HMO/i.test(line)) { currentNetwork = 'HMO'; continue; }
+    if (/Blue\s*Choice[\s-]*(?:PPO|Basic[\s-]*PPO)/i.test(line)) { currentNetwork = 'PPO'; isHSA = false; continue; }
+    if (/Blue\s*Advantage[\s-]*HMO/i.test(line)) { currentNetwork = 'HMO'; isHSA = false; continue; }
+    if (/Blue\s*Choice[\s-]*HSA|HSA\s*Qualified/i.test(line)) { currentNetwork = 'PPO'; isHSA = true; continue; }
 
     // Track metal level context
     if (/^Platinum$/i.test(line)) { currentMetal = 'Platinum'; continue; }
@@ -2500,7 +2525,7 @@ function extractFromBCBSGrid(text, sourceFile) {
 
     // Skip header/footer lines
     if (/^Plan\s*ID$/i.test(line)) continue;
-    if (/^(?:Individual|Coinsurance|Primary|ER|Urgent|In-Patient|Out-Patient|Non-|EOESECEF|Total|Monthly|Medical|Cost|Ded|Network|Preferred|Pharmacy)/i.test(line)) continue;
+    if (/^(?:Individual|Coinsurance|Primary|ER\s|Urgent|In-Patient|Out-Patient|Non-|EOESECEF|Total|Monthly|Medical|Cost|Ded|Network|Preferred|Pharmacy|Rates\s+and|Office|Visit|Per\s+ER|Care|Copay|Specialist|Virtual|Out-of-)/i.test(line)) continue;
     if (/^Go\s*to\s*Proposal/i.test(line)) continue;
     if (/^Blue\s*Cross\s*and/i.test(line)) continue;
     if (/^Quote\s*ID:/i.test(line)) continue;
@@ -2517,6 +2542,12 @@ function extractFromBCBSGrid(text, sourceFile) {
 
     // Skip optional footnote markers
     if (nextIdx < lines.length && FOOTNOTE_RE.test(lines[nextIdx].trim())) nextIdx++;
+
+    // Validate: next non-empty line after plan ID must be a deductible line ($X//)
+    // This prevents matching random alphanumeric lines as plan IDs
+    let peekIdx = nextIdx;
+    while (peekIdx < lines.length && lines[peekIdx].trim() === '') peekIdx++;
+    if (peekIdx >= lines.length || !/^\$\d[\d,]*\s*\/\//.test(lines[peekIdx].trim())) continue;
 
     // Helper to read next non-empty line
     function nextLine() {
@@ -3153,6 +3184,10 @@ function deduplicatePlans(plans) {
       if (k === 'id' || k === 'extractionConfidence') continue;
       if (existing[k] == null && donor[k] != null) existing[k] = donor[k];
     }
+    // Prefer a descriptive plan name over generic "Plan N"
+    if (/^Plan\s*\d+$/i.test(existing.planName) && donor.planName && !/^Plan\s*\d+$/i.test(donor.planName)) {
+      existing.planName = donor.planName;
+    }
     recalcConfidence(existing);
   }
 
@@ -3172,7 +3207,12 @@ function deduplicatePlans(plans) {
       // Don't merge if both plans have distinct premium values (they are different plans)
       const bothHavePremiums = plan.premiumEE != null && existing.premiumEE != null;
       const premiumsDiffer = bothHavePremiums && Math.abs(plan.premiumEE - existing.premiumEE) > 0.01;
-      if (nameMatch && carrierMatch && !premiumsDiffer) {
+      // Premium fingerprint match: if ALL available premiums match, plans are the same regardless of name
+      const premiumKeys = ['premiumEE','premiumES','premiumEC','premiumEF'];
+      const sharedPremiums = premiumKeys.filter(k => plan[k] != null && existing[k] != null);
+      const premiumFingerprint = sharedPremiums.length >= 2 &&
+        sharedPremiums.every(k => Math.abs(plan[k] - existing[k]) < 0.01);
+      if ((nameMatch && carrierMatch && !premiumsDiffer) || (premiumFingerprint && carrierMatch)) {
         mergePlanInto(existing, plan);
         merged = true;
         break;
@@ -4094,13 +4134,14 @@ function scorePlans(plans, census, contribution) {
 
 app.post('/recommend', (req, res) => {
   try {
-    const { caseId, census, contribution } = req.body;
+    const { caseId, census, contribution, currentPremiums } = req.body;
     if (!caseId) return res.status(400).json({ error: 'caseId is required' });
     const caseData = caseStore.get(caseId);
     if (!caseData) return res.status(404).json({ error: 'Case not found' });
 
     if (census) caseData.census = census;
     if (contribution) caseData.contribution = normalizeContributionConfig(contribution);
+    if (currentPremiums) caseData.currentPremiums = currentPremiums;
     if (!caseData.contribution) caseData.contribution = defaultContributionConfig();
     const plans = caseData.plans || [];
     if (plans.length === 0) return res.status(400).json({ error: 'No plans to score — run /parse first' });
@@ -4148,7 +4189,24 @@ app.post('/recommend', (req, res) => {
     };
     caseStore.set(caseId, caseData);
 
-    res.json({ caseId, recommendations, allPlans: allScored, contribution: caseData.contribution });
+    // Compute delta vs current premiums for each recommendation
+    const cp = caseData.currentPremiums || {};
+    const hasCurrentPremiums = cp.ee != null || cp.es != null || cp.ec != null || cp.ef != null;
+    if (hasCurrentPremiums) {
+      for (const rec of recommendations) {
+        const deltas = {};
+        for (const [tier, premKey] of [['ee','premiumEE'],['es','premiumES'],['ec','premiumEC'],['ef','premiumEF']]) {
+          if (cp[tier] != null && rec[premKey] != null) {
+            const diff = rec[premKey] - cp[tier];
+            const pct = cp[tier] > 0 ? (diff / cp[tier]) * 100 : 0;
+            deltas[tier] = { current: cp[tier], quoted: rec[premKey], diff: Math.round(diff * 100) / 100, pct: Math.round(pct * 10) / 10 };
+          }
+        }
+        rec.deltaVsCurrent = deltas;
+      }
+    }
+
+    res.json({ caseId, recommendations, allPlans: allScored, contribution: caseData.contribution, currentPremiums: cp });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
