@@ -742,6 +742,31 @@ async function extractPlanFromText(text, sourceFile) {
       console.log(`[EXTRACT] Quality filter: kept ${plans.length} plans with premiums, removed ${allStrategyPlans.length - plans.length} without`);
     }
 
+    // Quality filter 2: When a carrier-specific strategy dominates (wins with high score),
+    // remove plans from generic strategies that share the same carrier but lack planCode
+    // and key benefit data (deductible) — these are typically garbage partial extractions.
+    const CARRIER_STRATEGIES = ['BCBS proposal grid', 'BCBS proposal card', 'Aetna cost grid', 'BSW vertical format', 'BSW rate sheet', 'UHC quote grid'];
+    if (CARRIER_STRATEGIES.includes(best.name) && best.plans.length >= 3) {
+      const bestPlanCodes = new Set(best.plans.map(p => (p.planCode || '').toUpperCase()).filter(c => c.length >= 4));
+      if (bestPlanCodes.size > 0) {
+        const beforeCount = plans.length;
+        plans = plans.filter(p => {
+          // Keep plans that have a planCode
+          if (p.planCode && p.planCode.length >= 4) return true;
+          // Keep plans from a different carrier
+          const bestCarrier = (best.plans[0] && best.plans[0].carrier || '').toLowerCase();
+          const planCarrier = (p.carrier || '').toLowerCase();
+          if (planCarrier && bestCarrier && planCarrier !== bestCarrier) return true;
+          // Remove plans that lack both planCode and deductible data (junk from generic strategies)
+          if (p.deductibleIndividual == null) return false;
+          return true;
+        });
+        if (plans.length < beforeCount) {
+          console.log(`[EXTRACT] Quality filter 2: removed ${beforeCount - plans.length} junk plans lacking planCode+benefits (carrier-specific strategy "${best.name}" dominates)`);
+        }
+      }
+    }
+
     // Store debug info for last extraction
     lastExtractDebug = {
       timestamp: new Date().toISOString(),
@@ -3371,11 +3396,17 @@ function deduplicatePlans(plans) {
       const bothHavePremiums = plan.premiumEE != null && existing.premiumEE != null;
       const premiumsDiffer = bothHavePremiums && Math.abs(plan.premiumEE - existing.premiumEE) > 0.01;
       // Premium fingerprint match: if ALL available premiums match, plans are the same regardless of name
+      // BUT only if benefits don't differ (different deductibles/OOP = different plan even with same rate)
       const premiumKeys = ['premiumEE','premiumES','premiumEC','premiumEF'];
       const sharedPremiums = premiumKeys.filter(k => plan[k] != null && existing[k] != null);
       const premiumFingerprint = sharedPremiums.length >= 2 &&
         sharedPremiums.every(k => Math.abs(plan[k] - existing[k]) < 0.01);
-      if ((nameMatch && carrierMatch && !premiumsDiffer) || (premiumFingerprint && carrierMatch) || (planCodeMatch && carrierMatch)) {
+      // Check if benefits differ — plans with different deductibles/OOP are distinct even with same premiums
+      const benefitKeys = ['deductibleIndividual','deductibleFamily','oopMaxIndividual','oopMaxFamily'];
+      const sharedBenefits = benefitKeys.filter(k => plan[k] != null && existing[k] != null);
+      const benefitsDiffer = sharedBenefits.length >= 1 &&
+        sharedBenefits.some(k => Math.abs(plan[k] - existing[k]) > 0.01);
+      if ((nameMatch && carrierMatch && !premiumsDiffer) || (premiumFingerprint && carrierMatch && !benefitsDiffer) || (planCodeMatch && carrierMatch)) {
         mergePlanInto(existing, plan);
         merged = true;
         break;
